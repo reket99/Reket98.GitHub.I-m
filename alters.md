@@ -1,91 +1,115 @@
 # Pentesting Notes: AlterX Subdomain Wordlist Generator
 
-**Article**: *Alterx Subdomain Wordlist Generator* by Abhirup Konwar (System Weakness, May 22, 2025) :contentReference[oaicite:1]{index=1}
+**Source**: *AlterX Subdomain Wordlist Generator — How to expand Attack Surface for more vulnerabilities*  
+Author: Abhirup Konwar (System Weakness, May 22, 2025)  
+Tool: [ProjectDiscovery / alterx](https://github.com/projectdiscovery/alterx)
 
 ---
 
-##  Overview
-
-- AlterX is a fast, customizable subdomain wordlist generator that uses a DSL (domain-specific language) rather than hardcoded patterns. It was developed by ProjectDiscovery — the same team behind **subfinder**. :contentReference[oaicite:2]{index=2}
-- It fits into active enumeration pipelines by deriving permutations from known passive subdomain results, significantly improving efficiency and success rate. :contentReference[oaicite:3]{index=3}
+## ⚠️ Disclaimer
+Educational and **authorized pentesting only**. Author and tool creators are not responsible for misuse.
 
 ---
 
-##  Key Features & Options
-
-###  Input & Output
-- Accepts subdomain lists via:
-  - `-l`, `--list` (stdin, comma-separated, or file)
-- Outputs include:
-  - `-o`, `--output` (write to file)
-  - `-es`, `--estimate` (predict count without generating)
-  - `-ms`, `--max-size` (limit export size)
-  - `-v`, `--verbose` and `--silent`
-  - `-version`, `-update`, `--disable-update-check` flags :contentReference[oaicite:4]{index=4}
-
-###  DSL-Based Patterns & Variables
-AlterX uses customizable variables similar to Nuclei templates:
-- **Basic Variables**:
-  - `{{sub}}`, `{{suffix}}`, `{{tld}}`, `{{etld}}`
-- **Advanced Variables**:
-  - `{{sld}}`, `{{root}}`, `{{sub1}}`, `{{sub2}}` :contentReference[oaicite:5]{index=5}
-
-###  Pattern Examples
-Given `api.scanme.sh` and `word = prod`:
-```
-"{{sub}}-{{word}}.{{suffix}}"   → api-prod.scanme.sh
-"{{word}}-{{sub}}.{{suffix}}"   → prod-api.scanme.sh
-"{{word}}.{{sub}}.{{suffix}}"   → prod.api.scanme.sh
-"{{sub}}.{{word}}.{{suffix}}"   → api.prod.scanme.sh
-```
-Custom `permutations.yaml` allows even more flexibility. :contentReference[oaicite:6]{index=6}
-
-###  Additional Features
-- `-en`, `--enrich`: extracts words (e.g., `staging`, `qa`) from input subdomains to expand payloads.
-- Automatic deduplication (avoids redundant patterns like `api-api.domain.com`).
-- Other useful flags:
-  - `-limit` (cap output count)
-  - `-ac` (custom config yaml)
-  - `-pp` (override variable payloads)
-  - Built-in update functionality :contentReference[oaicite:7]{index=7}
-
----
-
-##  Example Usage
+## 📥 Installation (Direct Binary Download)
 
 ```bash
-# Generate permutations from passive results and resolve with dnsx:
-$ chaos -d tesla.com | alterx | dnsx
+# Download AlterX release (Linux amd64 example)
+wget -4 https://github.com/projectdiscovery/alterx/releases/download/v0.0.6/alterx_0.0.6_linux_amd64.zip
 
-# Result sample:
-[INF] Generated 8312 permutations in 0.0740s
-auth-global-stage.tesla.com
-auth-stage.tesla.com
-digitalassets-stage.tesla.com
-... etc.
+# Unzip
+unzip alterx_0.0.6_linux_amd64.zip
+
+# Copy/move binary to /usr/bin/
+sudo cp alterx /usr/bin/
+
+# Verify installation
+ls /usr/bin/ | grep -i "alterx"
 ```
-Using `-enrich` increases context-aware results: `chaos | alterx -enrich` :contentReference[oaicite:8]{index=8}
 
 ---
 
-##  Summary Table
+## 📕 Help Manual
 
-| Feature                    | Description                                                                 |
-|---------------------------|-----------------------------------------------------------------------------|
-| DSL-based patterns        | Customizable templates for efficient permutation generation                 |
-| Enrichment                | Extracts contextual words from input for smarter permutations               |
-| Deduplication             | Avoids generating redundant subdomain permutations                          |
-| Flexible configuration    | Supports flags like `-limit`, `-ac`, `-pp`, and output control               |
-| Pipeline integration      | Works seamlessly with tools like `dnsx` for validation                      |
+```bash
+alterx -h
+```
 
 ---
 
-##  References
+## ⚔️ Core Commands
 
-- AlterX GitHub: ProjectDiscovery’s `alterx` repo :contentReference[oaicite:9]{index=9}  
-- Official ProjectDiscovery description of AlterX functionality :contentReference[oaicite:10]{index=10}  
+1️⃣ **Generate subdomain permutations for any domain**
+```bash
+echo "www.redacted.com" | alterx
+```
+
+2️⃣ **Save output into a file**
+```bash
+echo "www.redacted.com" | alterx > alterx_nasa.txt
+```
+
+3️⃣ **Generate permutations from previously discovered subs (e.g. with subfinder)**
+```bash
+# Discover subs first
+subfinder -d redacted.com -all -recursive > subfinder_domain.txt
+
+# Feed into AlterX
+cat subfinder_domain.txt | alterx > alterx2_nasa.txt
+```
+
+4️⃣ **Change the default AlterX pattern**
+
+Hyphen pattern:
+```bash
+cat subfinder_nasa.txt | alterx -enrich -p '{{word}}-{{suffix}}' > alterx_pattern1_nasa.txt
+```
+
+Underscore pattern:
+```bash
+cat subfinder_nasa.txt | alterx -enrich -p '{{word}}_{{suffix}}' > alterx_pattern2_nasa.txt
+```
+
+5️⃣ **Use httpx to probe live subdomains**
+
+Basic:
+```bash
+cat sub-file-name.txt | httpx > live_subs_domain.txt
+```
+
+With additional detection (IP, vhost, status code, tech stack):
+```bash
+cat sub-file-name.txt | httpx -ip -vhost -sc -td > live_subs_domain_detailed.txt
+```
 
 ---
 
-**Usage Reminder:** Use AlterX responsibly and only during authorized security assessments.
+## 💡 Tips
 
+- Understand the **target’s subdomain naming convention** before choosing patterns.  
+- Use enrichment (`-enrich`) to extract contextual words (e.g., staging, qa, dev).  
+- Running at scale may take hours/days — recommended to use a **VPS** for heavy wordlist generation and probing.
+
+---
+
+## 🧩 Community Notes (from comments)
+
+- Combine with `dnsx` and `shuffledns` for resolution workflows:
+```bash
+subfinder -d domain -all | dnsx -r
+
+# If you see Akamai or Cloudflare → update resolvers and retry
+subfinder -d domain -all | alterx > list.txt
+shuffledns -l list.txt -r resolvers.txt -mode resolve
+```
+
+---
+
+## ✅ Key Takeaways
+
+- AlterX extends **attack surface discovery** by generating intelligent permutations.  
+- Integrates seamlessly with **subfinder**, **httpx**, **dnsx**, and **shuffledns**.  
+- Customizable patterns (`-p`) make it adaptable to naming conventions.  
+- Faster, more flexible than static wordlists.
+
+---
