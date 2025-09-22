@@ -1,0 +1,8 @@
+kubectl get pods --all-namespaces -o json | jq -r '
+  .items[] as $pod |
+  $pod.spec.containers[] as $container |
+  ($container.env // [])[] |
+  select(has("value")) |
+  select(.name | test("PASSWORD|SECRET|TOKEN|KEY|TOKEN_ISSUER"; "i")) |
+  "Namespace: \($pod.metadata.namespace), Pod: \($pod.metadata.name), Container: \($container.name) has plaintext env var: \(.name)"
+'
