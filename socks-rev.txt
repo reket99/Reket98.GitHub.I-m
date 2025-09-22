@@ -1,0 +1,8 @@
+Server
+
+RUST_LOG=info ./socks-rev socks 0.0.0.0:9002 127.0.0.1:1080  | grep -v DEBUG
+
+
+Client:
+
+ ./socks-rev gw   4.tcp.ngrok.io:19829  | grep -v DEBUG
