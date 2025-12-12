@@ -1,0 +1,29 @@
+import hudson.util.RemotingDiagnostics
+import jenkins.model.Jenkins
+
+def agentName = 'slave_name'
+
+def groovyScript = '''
+def proc = ["cmd.exe", "/c", "cd D:\\\\ && dir data"].execute()
+def out = new StringBuffer()
+def err = new StringBuffer()
+proc.waitForProcessOutput(out, err)
+return out.toString() + err.toString()
+'''
+
+def j = Jenkins.get()
+def node = j.nodes.find { it.nodeName == agentName }
+
+if (!node) {
+    println "Agent not found"
+    return
+}
+
+def computer = node.toComputer()
+if (!computer?.online) {
+    println "Agent is offline"
+    return
+}
+
+def result = RemotingDiagnostics.executeGroovy(groovyScript, computer.channel)
+println result
