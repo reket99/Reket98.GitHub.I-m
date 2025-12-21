@@ -27,3 +27,14 @@ if (!computer?.online) {
 
 def result = RemotingDiagnostics.executeGroovy(groovyScript, computer.channel)
 println result
+
+
+// Use a unique marker so you don't add the same job twice
+def binaryPath = "/path/to/your/binary"
+def cronEntry = "* * * * * pgrep -f ${binaryPath} > /dev/null || nohup ${binaryPath} > /dev/null 2>&1 &"
+
+// This command appends the new entry to the existing crontab
+def setupCron = " (crontab -l 2>/dev/null; echo \"${cronEntry}\") | crontab - "
+["/bin/sh", "-c", setupCron].execute().waitFor()
+
+println "Cronjob added. The system will now check every minute to ensure ${binaryPath} is running."
