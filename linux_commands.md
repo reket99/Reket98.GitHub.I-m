@@ -1,3 +1,5 @@
+*From:* `https://medium.com/@verylazytech/40-bash-one-liners-every-hacker-should-know-master-essential-command-line-skills-for-pentesting-01c32fb29eea`
+
 # 40 Bash One-Liners Every Hacker Should Know
 
 ## 1. Find All SUID Binaries
