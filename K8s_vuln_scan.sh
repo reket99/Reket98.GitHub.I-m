@@ -10,7 +10,15 @@
 #   ./k8s_vuln_scan.sh -n prod -o out.txt     # both
 # =============================================================================
 
-set -euo pipefail
+set -uo pipefail
+# Note: -e (errexit) intentionally omitted — kubectl commands routinely return
+# non-zero when a resource type doesn't exist (e.g. CRDs not installed, no
+# objects of that kind). Exiting on every non-zero would abort the whole scan.
+
+# ── Safe kubectl wrapper ──────────────────────────────────────────────────────
+# Returns empty string (never fails) so pipelines into python3 always get valid
+# input. Python blocks handle empty input via their own try/except guards.
+kctl() { kubectl "$@" 2>/dev/null || true; }
 
 # ── Colours ───────────────────────────────────────────────────────────────────
 RED='\033[0;31m'
@@ -92,9 +100,15 @@ check_rbac() {
   # ── 1a. cluster-admin bindings ──────────────────────────────────────────────
   log "Checking ClusterRoleBindings for cluster-admin..."
   local _out
-  _out=$(kubectl get clusterrolebindings -o json 2>/dev/null | python3 - << 'PYEOF'
+  _out=$(kctl get clusterrolebindings -o json 2>/dev/null | python3 - << 'PYEOF'
 import sys, json
-data = json.load(sys.stdin)
+try:
+    _raw = sys.stdin.read().strip()
+    data = json.loads(_raw) if _raw else {}
+except Exception:
+    data = {}
+if not isinstance(data, dict):
+    data = {}
 found = False
 for crb in data.get('items', []):
     role  = crb.get('roleRef', {}).get('name', '')
@@ -123,9 +137,15 @@ PYEOF
   # ── 1b. Wildcard permissions ────────────────────────────────────────────────
   log "Checking ClusterRoles for wildcard (*) permissions..."
   local _wc
-  _wc=$(kubectl get clusterroles -o json 2>/dev/null | python3 - << 'PYEOF'
+  _wc=$(kctl get clusterroles -o json 2>/dev/null | python3 - << 'PYEOF'
 import sys, json
-data = json.load(sys.stdin)
+try:
+    _raw = sys.stdin.read().strip()
+    data = json.loads(_raw) if _raw else {}
+except Exception:
+    data = {}
+if not isinstance(data, dict):
+    data = {}
 skip_prefixes = ('system:','kubeadm:','calico','azure','aks','omsagent')
 found = False
 for cr in data.get('items', []):
@@ -148,9 +168,15 @@ PYEOF
   # ── 1c. Anonymous access via RBAC ───────────────────────────────────────────
   log "Checking for RBAC rules granting access to unauthenticated users..."
   local _anon
-  _anon=$(kubectl get clusterrolebindings -o json 2>/dev/null | python3 - << 'PYEOF'
+  _anon=$(kctl get clusterrolebindings -o json 2>/dev/null | python3 - << 'PYEOF'
 import sys, json
-data = json.load(sys.stdin)
+try:
+    _raw = sys.stdin.read().strip()
+    data = json.loads(_raw) if _raw else {}
+except Exception:
+    data = {}
+if not isinstance(data, dict):
+    data = {}
 found = False
 for crb in data.get('items', []):
     cname = crb.get('metadata',{}).get('name','')
@@ -170,9 +196,15 @@ PYEOF
   # ── 1d. Default SA with elevated RoleBindings ──────────────────────────────
   log "Checking for non-default RoleBindings on 'default' ServiceAccounts..."
   local _defsa
-  _defsa=$(kubectl get rolebindings $NS_FLAG -o json 2>/dev/null | python3 - << 'PYEOF'
+  _defsa=$(kctl get rolebindings $NS_FLAG -o json 2>/dev/null | python3 - << 'PYEOF'
 import sys, json
-data = json.load(sys.stdin)
+try:
+    _raw = sys.stdin.read().strip()
+    data = json.loads(_raw) if _raw else {}
+except Exception:
+    data = {}
+if not isinstance(data, dict):
+    data = {}
 found = False
 for rb in data.get('items', []):
     ns   = rb.get('metadata',{}).get('namespace','?')
@@ -193,9 +225,15 @@ PYEOF
   # ── 1e. Namespace-scoped Role wildcards ────────────────────────────────────
   log "Checking namespace Roles for wildcard (*) permissions..."
   local _rolewc
-  _rolewc=$(kubectl get roles $NS_FLAG -o json 2>/dev/null | python3 - << 'PYEOF'
+  _rolewc=$(kctl get roles $NS_FLAG -o json 2>/dev/null | python3 - << 'PYEOF'
 import sys, json
-data = json.load(sys.stdin)
+try:
+    _raw = sys.stdin.read().strip()
+    data = json.loads(_raw) if _raw else {}
+except Exception:
+    data = {}
+if not isinstance(data, dict):
+    data = {}
 found = False
 for r in data.get('items', []):
     ns   = r.get('metadata',{}).get('namespace','?')
@@ -216,9 +254,15 @@ PYEOF
   # ── 1f. Secrets read permissions (get/list/watch on secrets) ──────────────
   log "Checking for Roles/ClusterRoles that can read Secrets..."
   local _secread
-  _secread=$(kubectl get clusterroles,roles $NS_FLAG -o json 2>/dev/null | python3 - << 'PYEOF'
+  _secread=$(kctl get clusterroles,roles $NS_FLAG -o json 2>/dev/null | python3 - << 'PYEOF'
 import sys, json
-data = json.load(sys.stdin)
+try:
+    _raw = sys.stdin.read().strip()
+    data = json.loads(_raw) if _raw else {}
+except Exception:
+    data = {}
+if not isinstance(data, dict):
+    data = {}
 READ_VERBS = {'get','list','watch','*'}
 found = False
 for r in data.get('items', []):
@@ -245,9 +289,15 @@ PYEOF
   # ── 1g. Dangerous escalation verbs: impersonate, bind, escalate ───────────
   log "Checking for impersonate / bind / escalate verbs in Roles and ClusterRoles..."
   local _esc
-  _esc=$(kubectl get clusterroles,roles $NS_FLAG -o json 2>/dev/null | python3 - << 'PYEOF'
+  _esc=$(kctl get clusterroles,roles $NS_FLAG -o json 2>/dev/null | python3 - << 'PYEOF'
 import sys, json
-data = json.load(sys.stdin)
+try:
+    _raw = sys.stdin.read().strip()
+    data = json.loads(_raw) if _raw else {}
+except Exception:
+    data = {}
+if not isinstance(data, dict):
+    data = {}
 DANGER = {'impersonate','bind','escalate'}
 found = False
 for r in data.get('items', []):
@@ -273,9 +323,14 @@ PYEOF
   # ── 1h. Orphaned RoleBindings (subject SA no longer exists) ───────────────
   log "Checking for RoleBindings referencing non-existent ServiceAccounts..."
   local _orphan
-  _orphan=$(kubectl get rolebindings,clusterrolebindings $NS_FLAG -o json 2>/dev/null | python3 - << 'PYEOF'
+  _orphan=$(kctl get rolebindings,clusterrolebindings $NS_FLAG -o json 2>/dev/null | python3 - << 'PYEOF'
 import sys, json, subprocess, shlex
-data = json.load(sys.stdin)
+try:
+    _raw = sys.stdin.read().strip()
+    data = json.loads(_raw) if _raw else {}
+except Exception:
+    data = {}
+if not isinstance(data, dict): data = {}
 found = False
 checked = {}
 for rb in data.get('items', []):
@@ -290,11 +345,14 @@ for rb in data.get('items', []):
         if key in checked:
             exists = checked[key]
         else:
-            r = subprocess.run(
-                shlex.split(f'kubectl get serviceaccount {sa_name} -n {sa_ns} --no-headers'),
-                capture_output=True, text=True
-            )
-            exists = r.returncode == 0
+            try:
+                r = subprocess.run(
+                    shlex.split(f'kubectl get serviceaccount {sa_name} -n {sa_ns} --no-headers'),
+                    capture_output=True, text=True, timeout=10
+                )
+                exists = r.returncode == 0
+            except Exception:
+                exists = True  # assume exists on error to avoid false positives
             checked[key] = exists
         if not exists:
             print(f'HIGH|{kind} "{rb_name}" (ns: {rb_ns or "cluster-wide"}) references missing SA "{sa_name}" in ns "{sa_ns}"')
@@ -315,7 +373,7 @@ check_privileged_workloads() {
   section "2/17 · Privileged & Unsafe Workloads"
 
   log "Scanning all pods for security context issues..."
-  kubectl get pods $NS_FLAG -o json 2>/dev/null | python3 - << 'PYEOF'
+  kctl get pods $NS_FLAG -o json 2>/dev/null | python3 - << 'PYEOF'
 import sys, json
 
 DANGEROUS_CAPS = {'SYS_ADMIN','NET_ADMIN','SYS_PTRACE','SYS_MODULE',
@@ -325,7 +383,12 @@ DANGEROUS_HOST_PATHS = {'/','/etc','/root','/proc','/sys',
                         '/var/run/docker.sock','/var/run/crio.sock',
                         '/run/containerd','/var/lib/kubelet'}
 
-data   = json.load(sys.stdin)
+try:
+    _raw = sys.stdin.read().strip()
+    data = json.loads(_raw) if _raw else {}
+except Exception:
+    data = {}
+if not isinstance(data, dict): data = {}
 issues = []
 ok     = 0
 
@@ -388,11 +451,16 @@ if not issues:
 PYEOF
   # shellcheck disable=SC2034
   local _dummy
-  kubectl get pods $NS_FLAG -o json 2>/dev/null | python3 -c "
+  kctl get pods $NS_FLAG -o json 2>/dev/null | python3 -c "
 import sys, json
 DANGEROUS_CAPS = {'SYS_ADMIN','NET_ADMIN','SYS_PTRACE','SYS_MODULE','DAC_OVERRIDE','DAC_READ_SEARCH','SYS_RAWIO','SYS_BOOT','SYS_NICE','MKNOD','ALL'}
 DANGEROUS_HOST_PATHS = {'/','/etc','/root','/proc','/sys','/var/run/docker.sock','/var/run/crio.sock','/run/containerd','/var/lib/kubelet'}
-data = json.load(sys.stdin)
+try:
+    _raw = sys.stdin.read().strip()
+    data = json.loads(_raw) if _raw else {}
+except Exception:
+    data = {}
+if not isinstance(data, dict): data = {}
 issues = []
 ok = 0
 for pod in data.get('items', []):
@@ -432,9 +500,14 @@ if not issues: print(f'PASS|cluster|All {ok} containers passed workload security
   # ── 2b. Additional workload hardening checks ──────────────────────────────
   log "Checking for shareProcessNamespace, missing capability drops, runAsNonRoot, procMount..."
   local _extra
-  _extra=$(kubectl get pods $NS_FLAG -o json 2>/dev/null | python3 -c "
+  _extra=$(kctl get pods $NS_FLAG -o json 2>/dev/null | python3 -c "
 import sys, json, re
-data = json.load(sys.stdin)
+try:
+    _raw = sys.stdin.read().strip()
+    data = json.loads(_raw) if _raw else {}
+except Exception:
+    data = {}
+if not isinstance(data, dict): data = {}
 found = False
 PUBLIC_REGISTRIES = ('docker.io','index.docker.io','registry-1.docker.io','ghcr.io','quay.io','gcr.io','public.ecr.aws')
 
@@ -511,9 +584,15 @@ if not found:
   # ── 2c. CronJob security checks ───────────────────────────────────────────
   log "Checking CronJobs for dangerous security contexts..."
   local _cron
-  _cron=$(kubectl get cronjobs $NS_FLAG -o json 2>/dev/null | python3 -c "
+  _cron=$(kctl get cronjobs $NS_FLAG -o json 2>/dev/null | python3 -c "
 import sys, json
-data = json.load(sys.stdin)
+try:
+    _raw = sys.stdin.read().strip()
+    data = json.loads(_raw) if _raw else {}
+except Exception:
+    data = {}
+if not isinstance(data, dict):
+    data = {}
 found = False
 for cj in data.get('items', []):
     ns   = cj.get('metadata',{}).get('namespace','?')
@@ -547,8 +626,8 @@ check_network_policies() {
 
   log "Checking namespaces for missing NetworkPolicies..."
   local all_ns covered any_missing=false
-  all_ns=$(kubectl get namespaces -o jsonpath='{.items[*].metadata.name}' 2>/dev/null)
-  covered=$(kubectl get networkpolicies $NS_FLAG \
+  all_ns=$(kctl get namespaces -o jsonpath='{.items[*].metadata.name}' 2>/dev/null)
+  covered=$(kctl get networkpolicies $NS_FLAG \
     -o jsonpath='{range .items[*]}{.metadata.namespace}{"\n"}{end}' 2>/dev/null | sort -u)
 
   for ns in $all_ns; do
@@ -562,9 +641,15 @@ check_network_policies() {
 
   log "Checking for default-deny NetworkPolicies..."
   local deny_found
-  deny_found=$(kubectl get networkpolicies $NS_FLAG -o json 2>/dev/null | python3 -c "
+  deny_found=$(kctl get networkpolicies $NS_FLAG -o json 2>/dev/null | python3 -c "
 import sys, json
-data = json.load(sys.stdin)
+try:
+    _raw = sys.stdin.read().strip()
+    data = json.loads(_raw) if _raw else {}
+except Exception:
+    data = {}
+if not isinstance(data, dict):
+    data = {}
 ns_deny = set()
 for np in data.get('items', []):
     ns   = np.get('metadata',{}).get('namespace','')
@@ -591,9 +676,15 @@ check_secrets_exposure() {
 
   log "Checking for Kubernetes Secrets injected as plain env vars..."
   local _env
-  _env=$(kubectl get pods $NS_FLAG -o json 2>/dev/null | python3 -c "
+  _env=$(kctl get pods $NS_FLAG -o json 2>/dev/null | python3 -c "
 import sys, json
-data = json.load(sys.stdin)
+try:
+    _raw = sys.stdin.read().strip()
+    data = json.loads(_raw) if _raw else {}
+except Exception:
+    data = {}
+if not isinstance(data, dict):
+    data = {}
 found = False
 for pod in data.get('items', []):
     ns = pod.get('metadata',{}).get('namespace','?'); name = pod.get('metadata',{}).get('name','?')
@@ -612,9 +703,15 @@ if not found: print('PASS||No Secrets exposed directly as environment variables'
 
   log "Checking for auto-mounted ServiceAccount tokens on default SA..."
   local _token
-  _token=$(kubectl get pods $NS_FLAG -o json 2>/dev/null | python3 -c "
+  _token=$(kctl get pods $NS_FLAG -o json 2>/dev/null | python3 -c "
 import sys, json
-data = json.load(sys.stdin)
+try:
+    _raw = sys.stdin.read().strip()
+    data = json.loads(_raw) if _raw else {}
+except Exception:
+    data = {}
+if not isinstance(data, dict):
+    data = {}
 found = False
 for pod in data.get('items', []):
     ns = pod.get('metadata',{}).get('namespace','?'); name = pod.get('metadata',{}).get('name','?')
@@ -631,9 +728,15 @@ if not found: print('PASS||No pods using default SA with auto-mounted tokens')
   # ── 4b-extra. envFrom secretRef (entire Secret bulk-mounted as env) ────────
   log "Checking for envFrom secretRef (entire Secret injected into environment)..."
   local _envfrom
-  _envfrom=$(kubectl get pods $NS_FLAG -o json 2>/dev/null | python3 -c "
+  _envfrom=$(kctl get pods $NS_FLAG -o json 2>/dev/null | python3 -c "
 import sys, json
-data = json.load(sys.stdin)
+try:
+    _raw = sys.stdin.read().strip()
+    data = json.loads(_raw) if _raw else {}
+except Exception:
+    data = {}
+if not isinstance(data, dict):
+    data = {}
 found = False
 for pod in data.get('items', []):
     ns   = pod.get('metadata',{}).get('namespace','?')
@@ -654,9 +757,15 @@ if not found:
   # ── 4b-extra2. Secret volume mounts (secret as file) ─────────────────────
   log "Checking for Secrets mounted as volumes..."
   local _secvol
-  _secvol=$(kubectl get pods $NS_FLAG -o json 2>/dev/null | python3 -c "
+  _secvol=$(kctl get pods $NS_FLAG -o json 2>/dev/null | python3 -c "
 import sys, json
-data = json.load(sys.stdin)
+try:
+    _raw = sys.stdin.read().strip()
+    data = json.loads(_raw) if _raw else {}
+except Exception:
+    data = {}
+if not isinstance(data, dict):
+    data = {}
 found = False
 for pod in data.get('items', []):
     ns   = pod.get('metadata',{}).get('namespace','?')
@@ -682,11 +791,15 @@ if not found:
   # ── 4b-extra3. TLS Secret certificate expiry ──────────────────────────────
   log "Checking TLS Secrets for expired or soon-expiring certificates..."
   local _tls_exp
-  _tls_exp=$(kubectl get secrets $NS_FLAG -o json 2>/dev/null | python3 -c "
+  _tls_exp=$(kctl get secrets $NS_FLAG -o json 2>/dev/null | python3 -c "
 import sys, json, base64, re
 from datetime import datetime, timezone
-
-data = json.load(sys.stdin)
+try:
+    _raw = sys.stdin.read().strip()
+    data = json.loads(_raw) if _raw else {}
+except Exception:
+    data = {}
+if not isinstance(data, dict): data = {}
 now  = datetime.now(timezone.utc)
 found = False
 
@@ -729,7 +842,7 @@ if not found:
   # embedded credentials or PEM blocks.
   log "Scanning ConfigMaps for secret-like key names and embedded credential values..."
   local _cm
-  _cm=$(kubectl get configmaps $NS_FLAG -o json 2>/dev/null | python3 -c "
+  _cm=$(kctl get configmaps $NS_FLAG -o json 2>/dev/null | python3 -c "
 import sys, json, re
 
 SYSTEM_PREFIXES = ('kube-','azure-','omsagent','coredns','extension-','flannel','calico',
@@ -749,7 +862,12 @@ VALUE_PATTERNS = [
 ]
 
 found = False
-data  = json.load(sys.stdin)
+try:
+    _raw = sys.stdin.read().strip()
+    data = json.loads(_raw) if _raw else {}
+except Exception:
+    data = {}
+if not isinstance(data, dict): data = {}
 
 for cm in data.get('items', []):
     ns   = cm.get('metadata',{}).get('namespace','?')
@@ -784,12 +902,17 @@ if not found:
   #   - Reports the variable name so triage is actionable
   log "Checking pod env vars for plaintext secrets (name matches + literal value present)..."
   local _lit
-  _lit=$(kubectl get pods $NS_FLAG -o json 2>/dev/null | python3 -c "
+  _lit=$(kctl get pods $NS_FLAG -o json 2>/dev/null | python3 -c "
 import sys, json, re
 
 SECRET_NAME_RE = re.compile(r'(?i)(password|passwd|secret|token|api.?key|sas.?key|private.?key|conn.?str|connectionstring|credential|auth.?token|client.?secret)')
 
-data  = json.load(sys.stdin)
+try:
+    _raw = sys.stdin.read().strip()
+    data = json.loads(_raw) if _raw else {}
+except Exception:
+    data = {}
+if not isinstance(data, dict): data = {}
 found = False
 
 for pod in data.get('items', []):
@@ -828,9 +951,15 @@ check_aks_specific() {
 
   log "Checking ServiceAccounts for Workload Identity vs token auto-mount..."
   local _wi
-  _wi=$(kubectl get serviceaccounts $NS_FLAG -o json 2>/dev/null | python3 -c "
+  _wi=$(kctl get serviceaccounts $NS_FLAG -o json 2>/dev/null | python3 -c "
 import sys, json
-data = json.load(sys.stdin)
+try:
+    _raw = sys.stdin.read().strip()
+    data = json.loads(_raw) if _raw else {}
+except Exception:
+    data = {}
+if not isinstance(data, dict):
+    data = {}
 for sa in data.get('items', []):
     ns = sa.get('metadata',{}).get('namespace','?'); name = sa.get('metadata',{}).get('name','?')
     anns = sa.get('metadata',{}).get('annotations', {})
@@ -847,9 +976,15 @@ for sa in data.get('items', []):
 
   log "Checking for legacy AAD Pod Identity (aadpodidbinding)..."
   local _podid
-  _podid=$(kubectl get pods $NS_FLAG -o json 2>/dev/null | python3 -c "
+  _podid=$(kctl get pods $NS_FLAG -o json 2>/dev/null | python3 -c "
 import sys, json
-data = json.load(sys.stdin)
+try:
+    _raw = sys.stdin.read().strip()
+    data = json.loads(_raw) if _raw else {}
+except Exception:
+    data = {}
+if not isinstance(data, dict):
+    data = {}
 found = False
 for pod in data.get('items', []):
     ns = pod.get('metadata',{}).get('namespace','?'); name = pod.get('metadata',{}).get('name','?')
@@ -865,9 +1000,15 @@ if not found: print('PASS|No legacy AAD Pod Identity bindings found')
 
   log "Checking workloads using raw K8s Secret volumes (vs AKV CSI)..."
   local _akv
-  _akv=$(kubectl get pods $NS_FLAG -o json 2>/dev/null | python3 -c "
+  _akv=$(kctl get pods $NS_FLAG -o json 2>/dev/null | python3 -c "
 import sys, json
-data = json.load(sys.stdin)
+try:
+    _raw = sys.stdin.read().strip()
+    data = json.loads(_raw) if _raw else {}
+except Exception:
+    data = {}
+if not isinstance(data, dict):
+    data = {}
 found = False
 for pod in data.get('items', []):
     ns = pod.get('metadata',{}).get('namespace','?'); name = pod.get('metadata',{}).get('name','?')
@@ -885,16 +1026,22 @@ if not found: print('PASS|All secret volumes use AKV CSI driver or no secret vol
 
   log "Checking for spot node pools without PodDisruptionBudgets..."
   local spot_nodes
-  spot_nodes=$(kubectl get nodes -o json 2>/dev/null | python3 -c "
+  spot_nodes=$(kctl get nodes -o json 2>/dev/null | python3 -c "
 import sys, json
-data = json.load(sys.stdin)
+try:
+    _raw = sys.stdin.read().strip()
+    data = json.loads(_raw) if _raw else {}
+except Exception:
+    data = {}
+if not isinstance(data, dict):
+    data = {}
 for n in data.get('items', []):
     if n.get('metadata',{}).get('labels',{}).get('kubernetes.azure.com/scalesetpriority') == 'spot':
         print(n.get('metadata',{}).get('name','?'))
 ")
   if [[ -n "$spot_nodes" ]]; then
     local pdb_count
-    pdb_count=$(kubectl get poddisruptionbudgets $NS_FLAG --no-headers 2>/dev/null | wc -l | tr -d ' ')
+    pdb_count=$(kctl get poddisruptionbudgets $NS_FLAG --no-headers 2>/dev/null | wc -l | tr -d ' ')
     if [[ "$pdb_count" -eq 0 ]]; then
       high "Spot node pool detected but no PodDisruptionBudgets found — workloads risk abrupt eviction"
     else
@@ -906,9 +1053,15 @@ for n in data.get('items', []):
 
   log "Checking hostNetwork pods for Azure IMDS (169.254.169.254) access risk..."
   local _imds
-  _imds=$(kubectl get pods $NS_FLAG -o json 2>/dev/null | python3 -c "
+  _imds=$(kctl get pods $NS_FLAG -o json 2>/dev/null | python3 -c "
 import sys, json
-data = json.load(sys.stdin)
+try:
+    _raw = sys.stdin.read().strip()
+    data = json.loads(_raw) if _raw else {}
+except Exception:
+    data = {}
+if not isinstance(data, dict):
+    data = {}
 found = False
 for pod in data.get('items', []):
     ns = pod.get('metadata',{}).get('namespace','?'); name = pod.get('metadata',{}).get('name','?')
@@ -925,10 +1078,10 @@ if not found: print('PASS|No hostNetwork pods that could access Azure IMDS')
   done
 
   log "Checking for OPA Gatekeeper / Azure Policy admission control..."
-  if kubectl get namespace gatekeeper-system &>/dev/null 2>&1; then
+  if kctl get namespace gatekeeper-system &>/dev/null 2>&1; then
     pass "OPA Gatekeeper (gatekeeper-system) is present"
     local ct_count
-    ct_count=$(kubectl get constrainttemplate --no-headers 2>/dev/null | wc -l | tr -d ' ')
+    ct_count=$(kctl get constrainttemplate --no-headers 2>/dev/null | wc -l | tr -d ' ')
     if [[ "$ct_count" -eq 0 ]]; then
       high "Gatekeeper installed but no ConstraintTemplates found — policies may not be enforced"
     else
@@ -947,7 +1100,7 @@ check_api_server() {
 
   log "Testing anonymous access to the API server..."
   local anon_check
-  anon_check=$(kubectl --as=system:anonymous get namespaces --no-headers 2>&1 || true)
+  anon_check=$(kctl --as=system:anonymous get namespaces --no-headers 2>&1 || true)
   if echo "$anon_check" | grep -qiE "forbidden|unauthorized"; then
     pass "Anonymous authentication is disabled"
   else
@@ -956,7 +1109,7 @@ check_api_server() {
 
   log "Verifying unauthenticated users cannot list pods..."
   local can_i_result
-  can_i_result=$(kubectl auth can-i list pods --as=system:unauthenticated 2>/dev/null || echo "no")
+  can_i_result=$(kctl auth can-i list pods --as=system:unauthenticated 2>/dev/null || echo "no")
   if [[ "$can_i_result" == "yes" ]]; then
     critical "Unauthenticated users can list pods — RBAC may not be enforced"
   else
@@ -965,9 +1118,15 @@ check_api_server() {
 
   log "Checking for Pod Security Admission labels on namespaces..."
   local _psa
-  _psa=$(kubectl get namespaces -o json 2>/dev/null | python3 -c "
+  _psa=$(kctl get namespaces -o json 2>/dev/null | python3 -c "
 import sys, json
-data = json.load(sys.stdin)
+try:
+    _raw = sys.stdin.read().strip()
+    data = json.loads(_raw) if _raw else {}
+except Exception:
+    data = {}
+if not isinstance(data, dict):
+    data = {}
 skip = {'kube-system','kube-public','kube-node-lease','gatekeeper-system'}
 for ns in data.get('items', []):
     name = ns.get('metadata',{}).get('name','')
@@ -984,9 +1143,15 @@ for ns in data.get('items', []):
 
   log "Checking for exposed Kubernetes Dashboard..."
   local _dash
-  _dash=$(kubectl get services $NS_FLAG -o json 2>/dev/null | python3 -c "
+  _dash=$(kctl get services $NS_FLAG -o json 2>/dev/null | python3 -c "
 import sys, json
-data = json.load(sys.stdin)
+try:
+    _raw = sys.stdin.read().strip()
+    data = json.loads(_raw) if _raw else {}
+except Exception:
+    data = {}
+if not isinstance(data, dict):
+    data = {}
 found = False
 for svc in data.get('items', []):
     name = svc.get('metadata',{}).get('name',''); ns = svc.get('metadata',{}).get('namespace','')
@@ -1012,9 +1177,15 @@ check_nodes() {
 
   log "Inspecting node health and configurations..."
   local _nodes
-  _nodes=$(kubectl get nodes -o json 2>/dev/null | python3 -c "
+  _nodes=$(kctl get nodes -o json 2>/dev/null | python3 -c "
 import sys, json
-data = json.load(sys.stdin)
+try:
+    _raw = sys.stdin.read().strip()
+    data = json.loads(_raw) if _raw else {}
+except Exception:
+    data = {}
+if not isinstance(data, dict):
+    data = {}
 issues = 0
 for node in data.get('items', []):
     name  = node.get('metadata',{}).get('name','?')
@@ -1039,9 +1210,15 @@ if issues == 0:
 
   log "Checking for overly broad tolerations (tolerate all taints)..."
   local _tol
-  _tol=$(kubectl get pods $NS_FLAG -o json 2>/dev/null | python3 -c "
+  _tol=$(kctl get pods $NS_FLAG -o json 2>/dev/null | python3 -c "
 import sys, json
-data = json.load(sys.stdin)
+try:
+    _raw = sys.stdin.read().strip()
+    data = json.loads(_raw) if _raw else {}
+except Exception:
+    data = {}
+if not isinstance(data, dict):
+    data = {}
 found = False
 for pod in data.get('items', []):
     ns = pod.get('metadata',{}).get('namespace','?'); name = pod.get('metadata',{}).get('name','?')
@@ -1064,9 +1241,15 @@ check_ingress() {
 
   log "Checking for Services with public LoadBalancer IPs..."
   local _lb
-  _lb=$(kubectl get services $NS_FLAG -o json 2>/dev/null | python3 -c "
+  _lb=$(kctl get services $NS_FLAG -o json 2>/dev/null | python3 -c "
 import sys, json
-data = json.load(sys.stdin)
+try:
+    _raw = sys.stdin.read().strip()
+    data = json.loads(_raw) if _raw else {}
+except Exception:
+    data = {}
+if not isinstance(data, dict):
+    data = {}
 PRIVATE = ('10.','172.16.','172.17.','172.18.','172.19.','172.20.','172.21.','172.22.',
            '172.23.','172.24.','172.25.','172.26.','172.27.','172.28.','172.29.','172.30.',
            '172.31.','192.168.')
@@ -1091,9 +1274,15 @@ if not found: print('PASS|No LoadBalancer services with assigned IPs found')
 
   log "Checking Ingress resources for missing TLS..."
   local _tls
-  _tls=$(kubectl get ingress $NS_FLAG -o json 2>/dev/null | python3 -c "
+  _tls=$(kctl get ingress $NS_FLAG -o json 2>/dev/null | python3 -c "
 import sys, json
-data = json.load(sys.stdin)
+try:
+    _raw = sys.stdin.read().strip()
+    data = json.loads(_raw) if _raw else {}
+except Exception:
+    data = {}
+if not isinstance(data, dict):
+    data = {}
 found = False
 for ing in data.get('items', []):
     ns = ing.get('metadata',{}).get('namespace','?'); name = ing.get('metadata',{}).get('name','?')
@@ -1110,9 +1299,15 @@ if not found: print('PASS|All Ingress resources have TLS configured')
 
   log "Checking for NodePort services..."
   local _np
-  _np=$(kubectl get services $NS_FLAG -o json 2>/dev/null | python3 -c "
+  _np=$(kctl get services $NS_FLAG -o json 2>/dev/null | python3 -c "
 import sys, json
-data = json.load(sys.stdin)
+try:
+    _raw = sys.stdin.read().strip()
+    data = json.loads(_raw) if _raw else {}
+except Exception:
+    data = {}
+if not isinstance(data, dict):
+    data = {}
 found = False
 for svc in data.get('items', []):
     ns = svc.get('metadata',{}).get('namespace','?'); name = svc.get('metadata',{}).get('name','?')
@@ -1129,9 +1324,14 @@ if not found: print('PASS|No NodePort services found')
   # ── 8d. ExternalName services (DNS rebinding / SSRF vector) ──────────────
   log "Checking for ExternalName services pointing outside the cluster..."
   local _extname
-  _extname=$(kubectl get services $NS_FLAG -o json 2>/dev/null | python3 -c "
+  _extname=$(kctl get services $NS_FLAG -o json 2>/dev/null | python3 -c "
 import sys, json, re
-data = json.load(sys.stdin)
+try:
+    _raw = sys.stdin.read().strip()
+    data = json.loads(_raw) if _raw else {}
+except Exception:
+    data = {}
+if not isinstance(data, dict): data = {}
 found = False
 INTERNAL = re.compile(r'(\.svc\.cluster\.local|\.svc$|^localhost$|^127\.|^10\.|^192\.168\.|^172\.(1[6-9]|2[0-9]|3[01])\.)')
 for svc in data.get('items', []):
@@ -1154,9 +1354,15 @@ if not found:
   # ── 8e. Ingress without authentication annotations ────────────────────────
   log "Checking Ingress resources for missing authentication annotations..."
   local _ingressauth
-  _ingressauth=$(kubectl get ingress $NS_FLAG -o json 2>/dev/null | python3 -c "
+  _ingressauth=$(kctl get ingress $NS_FLAG -o json 2>/dev/null | python3 -c "
 import sys, json
-data = json.load(sys.stdin)
+try:
+    _raw = sys.stdin.read().strip()
+    data = json.loads(_raw) if _raw else {}
+except Exception:
+    data = {}
+if not isinstance(data, dict):
+    data = {}
 AUTH_ANNOTATIONS = {
     'nginx.ingress.kubernetes.io/auth-url',
     'nginx.ingress.kubernetes.io/auth-signin',
@@ -1191,9 +1397,15 @@ check_least_privilege() {
 
   log "Checking for ClusterRoles with dangerous pod verbs (exec/attach/portforward)..."
   local _exec
-  _exec=$(kubectl get clusterroles -o json 2>/dev/null | python3 -c "
+  _exec=$(kctl get clusterroles -o json 2>/dev/null | python3 -c "
 import sys, json
-data = json.load(sys.stdin)
+try:
+    _raw = sys.stdin.read().strip()
+    data = json.loads(_raw) if _raw else {}
+except Exception:
+    data = {}
+if not isinstance(data, dict):
+    data = {}
 dangerous = {'exec','portforward','attach','proxy'}
 found = False
 for cr in data.get('items', []):
@@ -1212,9 +1424,15 @@ if not found: print('PASS|No non-system ClusterRoles with dangerous pod exec ver
 
   log "Checking for containers without resource limits (DoS risk)..."
   local _limits
-  _limits=$(kubectl get pods $NS_FLAG -o json 2>/dev/null | python3 -c "
+  _limits=$(kctl get pods $NS_FLAG -o json 2>/dev/null | python3 -c "
 import sys, json
-data = json.load(sys.stdin)
+try:
+    _raw = sys.stdin.read().strip()
+    data = json.loads(_raw) if _raw else {}
+except Exception:
+    data = {}
+if not isinstance(data, dict):
+    data = {}
 found = False
 for pod in data.get('items', []):
     ns = pod.get('metadata',{}).get('namespace','?'); name = pod.get('metadata',{}).get('name','?')
@@ -1230,13 +1448,13 @@ if not found: print('PASS|All containers have resource limits defined')
 
   log "Checking namespaces for LimitRange / ResourceQuota coverage..."
   local all_ns
-  all_ns=$(kubectl get namespaces -o jsonpath='{.items[*].metadata.name}' 2>/dev/null)
+  all_ns=$(kctl get namespaces -o jsonpath='{.items[*].metadata.name}' 2>/dev/null)
   local quota_issues=false
   for ns in $all_ns; do
     case "$ns" in kube-system|kube-public|kube-node-lease|gatekeeper-system) continue ;; esac
     local lr rq
-    lr=$(kubectl get limitrange -n "$ns" --no-headers 2>/dev/null | wc -l | tr -d ' ')
-    rq=$(kubectl get resourcequota -n "$ns" --no-headers 2>/dev/null | wc -l | tr -d ' ')
+    lr=$(kctl get limitrange -n "$ns" --no-headers 2>/dev/null | wc -l | tr -d ' ')
+    rq=$(kctl get resourcequota -n "$ns" --no-headers 2>/dev/null | wc -l | tr -d ' ')
     if [[ "$lr" -eq 0 && "$rq" -eq 0 ]]; then
       quota_issues=true
       high "Namespace \"$ns\" has no LimitRange or ResourceQuota — resource exhaustion risk"
@@ -1246,9 +1464,15 @@ if not found: print('PASS|All containers have resource limits defined')
 
   log "Checking for deprecated API versions in use..."
   local _dep
-  _dep=$(kubectl get ingresses,horizontalpodautoscalers,poddisruptionbudgets $NS_FLAG -o json 2>/dev/null | python3 -c "
+  _dep=$(kctl get ingresses,horizontalpodautoscalers,poddisruptionbudgets $NS_FLAG -o json 2>/dev/null | python3 -c "
 import sys, json
-data = json.load(sys.stdin)
+try:
+    _raw = sys.stdin.read().strip()
+    data = json.loads(_raw) if _raw else {}
+except Exception:
+    data = {}
+if not isinstance(data, dict):
+    data = {}
 deprecated = {'extensions/v1beta1','apps/v1beta1','apps/v1beta2','policy/v1beta1','networking.k8s.io/v1beta1','autoscaling/v2beta1'}
 found = False
 for item in data.get('items', []):
@@ -1265,9 +1489,15 @@ if not found: print('PASS|No resources using known deprecated API versions')
   # ── 9e. Roles that can create/update workloads (malicious pod injection) ───
   log "Checking for Roles/ClusterRoles that can create or update pods/deployments..."
   local _create
-  _create=$(kubectl get clusterroles,roles $NS_FLAG -o json 2>/dev/null | python3 -c "
+  _create=$(kctl get clusterroles,roles $NS_FLAG -o json 2>/dev/null | python3 -c "
 import sys, json
-data = json.load(sys.stdin)
+try:
+    _raw = sys.stdin.read().strip()
+    data = json.loads(_raw) if _raw else {}
+except Exception:
+    data = {}
+if not isinstance(data, dict):
+    data = {}
 WORKLOAD_RESOURCES = {'pods','deployments','daemonsets','statefulsets','jobs','cronjobs','replicationcontrollers'}
 CREATE_VERBS = {'create','update','patch','*'}
 found = False
@@ -1295,9 +1525,15 @@ if not found:
   # ── 9f. ValidatingWebhookConfiguration / MutatingWebhookConfiguration ─────
   log "Checking admission webhooks for insecure failure policies..."
   local _webhooks
-  _webhooks=$(kubectl get validatingwebhookconfigurations,mutatingwebhookconfigurations -o json 2>/dev/null | python3 -c "
+  _webhooks=$(kctl get validatingwebhookconfigurations,mutatingwebhookconfigurations -o json 2>/dev/null | python3 -c "
 import sys, json
-data = json.load(sys.stdin)
+try:
+    _raw = sys.stdin.read().strip()
+    data = json.loads(_raw) if _raw else {}
+except Exception:
+    data = {}
+if not isinstance(data, dict):
+    data = {}
 found = False
 for wh in data.get('items', []):
     kind = wh.get('kind','')
@@ -1326,9 +1562,15 @@ if not found:
   # ── 9g. RuntimeClass — pods without a hardened runtime ────────────────────
   log "Checking pods for RuntimeClass (gVisor/kata for stronger isolation)..."
   local _runtime
-  _runtime=$(kubectl get pods $NS_FLAG -o json 2>/dev/null | python3 -c "
+  _runtime=$(kctl get pods $NS_FLAG -o json 2>/dev/null | python3 -c "
 import sys, json
-data = json.load(sys.stdin)
+try:
+    _raw = sys.stdin.read().strip()
+    data = json.loads(_raw) if _raw else {}
+except Exception:
+    data = {}
+if not isinstance(data, dict):
+    data = {}
 skip_ns = {'kube-system','kube-public','kube-node-lease','gatekeeper-system'}
 no_runtime = 0
 with_runtime = 0
@@ -1355,10 +1597,15 @@ else:
   # ── 9h. Projected ServiceAccount tokens vs legacy long-lived tokens ────────
   log "Checking for legacy long-lived ServiceAccount tokens (non-projected)..."
   local _tokens
-  _tokens=$(kubectl get secrets $NS_FLAG -o json 2>/dev/null | python3 -c "
+  _tokens=$(kctl get secrets $NS_FLAG -o json 2>/dev/null | python3 -c "
 import sys, json
 from datetime import datetime, timezone
-data = json.load(sys.stdin)
+try:
+    _raw = sys.stdin.read().strip()
+    data = json.loads(_raw) if _raw else {}
+except Exception:
+    data = {}
+if not isinstance(data, dict): data = {}
 found = False
 for secret in data.get('items', []):
     if secret.get('type','') != 'kubernetes.io/service-account-token': continue
@@ -1387,14 +1634,14 @@ check_kubelet_api() {
   # using kubectl's port-forward or by inspecting the kubelet config ConfigMap.
   # On AKS we cannot SSH to nodes directly, so we use two indirect methods:
   #   a) Inspect the kubelet-config ConfigMap in kube-system (AKS stores it there)
-  #   b) Attempt a kubectl proxy round-trip to the kubelet /pods endpoint via API server
+  #   b) Attempt a kctl proxy round-trip to the kubelet /pods endpoint via API server
 
   # ── 10a. Kubelet ConfigMap — anonymous auth & AlwaysAllow ──────────────────
   log "Checking kubelet config for anonymous auth and AlwaysAllow authorization..."
   local _kcm
-  _kcm=$(kubectl get configmap kubelet-config -n kube-system -o json 2>/dev/null \
-    || kubectl get configmap kubelet-config-1.28 -n kube-system -o json 2>/dev/null \
-    || kubectl get configmap kubelet-config-1.27 -n kube-system -o json 2>/dev/null \
+  _kcm=$(kctl get configmap kubelet-config -n kube-system -o json 2>/dev/null \
+    || kctl get configmap kubelet-config-1.28 -n kube-system -o json 2>/dev/null \
+    || kctl get configmap kubelet-config-1.27 -n kube-system -o json 2>/dev/null \
     || echo '{}')
 
   echo "$_kcm" | python3 -c "
@@ -1434,12 +1681,12 @@ else:
   # ── 10b. Probe kubelet /pods via API server proxy ──────────────────────────
   log "Probing kubelet /pods endpoint through API server proxy for each node..."
   local nodes
-  nodes=$(kubectl get nodes -o jsonpath='{.items[*].metadata.name}' 2>/dev/null)
+  nodes=$(kctl get nodes -o jsonpath='{.items[*].metadata.name}' 2>/dev/null)
   local kubelet_issues=false
   for node in $nodes; do
-    # kubectl get --raw proxies directly to the kubelet through the API server
+    # kctl get --raw proxies directly to the kubelet through the API server
     local result
-    result=$(kubectl get --raw "/api/v1/nodes/${node}/proxy/pods" 2>&1 || true)
+    result=$(kctl get --raw "/api/v1/nodes/${node}/proxy/pods" 2>&1 || true)
     if echo "$result" | grep -q '"kind":"PodList"'; then
       kubelet_issues=true
       critical "Node \"$node\" — kubelet /pods endpoint accessible via API server proxy (verify kubelet auth is enforced)"
@@ -1454,7 +1701,7 @@ else:
   # ── 10c. Check for kubelet read-only port (10255) ──────────────────────────
   log "Checking if kubelet read-only port (10255) is referenced in node config..."
   local _ro
-  _ro=$(kubectl get configmap kubelet-config -n kube-system -o jsonpath='{.data.kubelet}' 2>/dev/null || echo "")
+  _ro=$(kctl get configmap kubelet-config -n kube-system -o jsonpath='{.data.kubelet}' 2>/dev/null || echo "")
   if echo "$_ro" | grep -q "readOnlyPort: 0"; then
     pass "Kubelet read-only port (10255) is disabled (readOnlyPort: 0)"
   elif echo "$_ro" | grep -q "readOnlyPort:"; then
@@ -1477,9 +1724,15 @@ check_etcd() {
   # ── 11a. ETCD pod / static manifest inspection ────────────────────────────
   log "Checking ETCD configuration via kube-system pods..."
   local _etcd
-  _etcd=$(kubectl get pods -n kube-system -o json 2>/dev/null | python3 -c "
+  _etcd=$(kctl get pods -n kube-system -o json 2>/dev/null | python3 -c "
 import sys, json
-data = json.load(sys.stdin)
+try:
+    _raw = sys.stdin.read().strip()
+    data = json.loads(_raw) if _raw else {}
+except Exception:
+    data = {}
+if not isinstance(data, dict):
+    data = {}
 found = False
 for pod in data.get('items', []):
     name = pod.get('metadata',{}).get('name','')
@@ -1531,15 +1784,21 @@ if not found:
   # ── 11b. Secrets encryption at rest (AKS) ─────────────────────────────────
   log "Checking for EncryptionConfiguration or KMS provider in kube-system..."
   local enc_found=false
-  if kubectl get secret -n kube-system -o name 2>/dev/null | grep -qi "encryption\|kms"; then
+  if kctl get secret -n kube-system -o name 2>/dev/null | grep -qi "encryption\|kms"; then
     enc_found=true
     pass "Encryption-related secret/config found in kube-system"
   fi
   # Also check for encryption config mounted in apiserver
   local _apienc
-  _apienc=$(kubectl get pods -n kube-system -o json 2>/dev/null | python3 -c "
+  _apienc=$(kctl get pods -n kube-system -o json 2>/dev/null | python3 -c "
 import sys, json
-data = json.load(sys.stdin)
+try:
+    _raw = sys.stdin.read().strip()
+    data = json.loads(_raw) if _raw else {}
+except Exception:
+    data = {}
+if not isinstance(data, dict):
+    data = {}
 for pod in data.get('items', []):
     name = pod.get('metadata',{}).get('name','')
     if 'kube-apiserver' not in name: continue
@@ -1561,9 +1820,15 @@ for pod in data.get('items', []):
   # ── 11c. ETCD port 2379 reachable from pods (via network policy check) ────
   log "Checking if any NetworkPolicy explicitly blocks ETCD port 2379..."
   local etcd_blocked=false
-  kubectl get networkpolicies $NS_FLAG -o json 2>/dev/null | python3 -c "
+  kctl get networkpolicies $NS_FLAG -o json 2>/dev/null | python3 -c "
 import sys, json
-data = json.load(sys.stdin)
+try:
+    _raw = sys.stdin.read().strip()
+    data = json.loads(_raw) if _raw else {}
+except Exception:
+    data = {}
+if not isinstance(data, dict):
+    data = {}
 for np in data.get('items', []):
     for erule in (np.get('spec',{}).get('egress') or []):
         for port in (erule.get('ports') or []):
@@ -1588,9 +1853,14 @@ check_insecure_api_port() {
   # ── 12a. Check kube-apiserver args for insecure-port ─────────────────────
   log "Checking kube-apiserver for --insecure-port configuration..."
   local _insecure
-  _insecure=$(kubectl get pods -n kube-system -o json 2>/dev/null | python3 -c "
+  _insecure=$(kctl get pods -n kube-system -o json 2>/dev/null | python3 -c "
 import sys, json, re
-data = json.load(sys.stdin)
+try:
+    _raw = sys.stdin.read().strip()
+    data = json.loads(_raw) if _raw else {}
+except Exception:
+    data = {}
+if not isinstance(data, dict): data = {}
 found_apiserver = False
 for pod in data.get('items', []):
     name = pod.get('metadata',{}).get('name','')
@@ -1628,18 +1898,19 @@ if not found_apiserver:
   # ── 12b. Attempt direct HTTP probe to API server on port 8080 ─────────────
   log "Attempting HTTP probe to API server on port 8080 via kubectl..."
   local api_url
-  api_url=$(kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}' 2>/dev/null)
+  api_url=$(kctl config view --minify -o jsonpath='{.clusters[0].cluster.server}' 2>/dev/null)
   local api_host
   api_host=$(echo "$api_url" | sed 's|https\?://||' | cut -d: -f1)
 
   if [[ -n "$api_host" ]]; then
-    # Use kubectl run with a probe pod would need network — instead check if
+    # Use kctl run with a probe pod would need network — instead check if
     # the API server exposes anything on the HTTP path via the proxy endpoint
     local probe_result
-    probe_result=$(kubectl get --raw "/api" 2>/dev/null | python3 -c "
+    probe_result=$(kctl get --raw "/api" 2>/dev/null | python3 -c "
 import sys, json
 try:
-    d = json.load(sys.stdin)
+    _raw2 = sys.stdin.read().strip()
+    d = json.loads(_raw2) if _raw2 else {}
     # If we got here with no TLS error, the API server is responding
     # We can't directly test port 8080 from outside, but we note the HTTPS is working
     print('PASS|API server HTTPS endpoint is responding correctly (port 8080 check requires network access)')
@@ -1659,9 +1930,15 @@ check_dashboard_hardening() {
 
   log "Checking Dashboard deployment for insecure arguments..."
   local _dashargs
-  _dashargs=$(kubectl get deployments $NS_FLAG -o json 2>/dev/null | python3 -c "
+  _dashargs=$(kctl get deployments $NS_FLAG -o json 2>/dev/null | python3 -c "
 import sys, json
-data = json.load(sys.stdin)
+try:
+    _raw = sys.stdin.read().strip()
+    data = json.loads(_raw) if _raw else {}
+except Exception:
+    data = {}
+if not isinstance(data, dict):
+    data = {}
 found = False
 for dep in data.get('items', []):
     name = dep.get('metadata',{}).get('name','')
@@ -1700,9 +1977,15 @@ if not found:
 
   # ── Dashboard SA permissions ───────────────────────────────────────────────
   log "Checking permissions of ServiceAccounts associated with Dashboard..."
-  kubectl get deployments $NS_FLAG -o json 2>/dev/null | python3 -c "
+  kctl get deployments $NS_FLAG -o json 2>/dev/null | python3 -c "
 import sys, json
-data = json.load(sys.stdin)
+try:
+    _raw = sys.stdin.read().strip()
+    data = json.loads(_raw) if _raw else {}
+except Exception:
+    data = {}
+if not isinstance(data, dict):
+    data = {}
 for dep in data.get('items', []):
     name = dep.get('metadata',{}).get('name','')
     ns   = dep.get('metadata',{}).get('namespace','')
@@ -1712,9 +1995,15 @@ for dep in data.get('items', []):
 " 2>/dev/null | while IFS='|' read -r ns sa; do
     # Check if this SA has cluster-admin or wide ClusterRoleBindings
     local bound_roles
-    bound_roles=$(kubectl get clusterrolebindings -o json 2>/dev/null | python3 -c "
+    bound_roles=$(kctl get clusterrolebindings -o json 2>/dev/null | python3 -c "
 import sys, json
-data = json.load(sys.stdin)
+try:
+    _raw = sys.stdin.read().strip()
+    data = json.loads(_raw) if _raw else {}
+except Exception:
+    data = {}
+if not isinstance(data, dict):
+    data = {}
 for crb in data.get('items', []):
     for subj in (crb.get('subjects') or []):
         if subj.get('kind') == 'ServiceAccount' and subj.get('name') == '${sa}' and subj.get('namespace','') == '${ns}':
@@ -1739,9 +2028,14 @@ check_apparmor() {
 
   log "Checking pods for AppArmor profile annotations..."
   local _aa
-  _aa=$(kubectl get pods $NS_FLAG -o json 2>/dev/null | python3 -c "
+  _aa=$(kctl get pods $NS_FLAG -o json 2>/dev/null | python3 -c "
 import sys, json, re
-data = json.load(sys.stdin)
+try:
+    _raw = sys.stdin.read().strip()
+    data = json.loads(_raw) if _raw else {}
+except Exception:
+    data = {}
+if not isinstance(data, dict): data = {}
 missing = 0
 enforced = 0
 skip_ns = {'kube-system','kube-public','kube-node-lease','gatekeeper-system'}
@@ -1802,9 +2096,15 @@ check_seccomp() {
 
   log "Checking pods for Seccomp profile configuration..."
   local _sc
-  _sc=$(kubectl get pods $NS_FLAG -o json 2>/dev/null | python3 -c "
+  _sc=$(kctl get pods $NS_FLAG -o json 2>/dev/null | python3 -c "
 import sys, json
-data = json.load(sys.stdin)
+try:
+    _raw = sys.stdin.read().strip()
+    data = json.loads(_raw) if _raw else {}
+except Exception:
+    data = {}
+if not isinstance(data, dict):
+    data = {}
 missing = 0
 enforced = 0
 skip_ns = {'kube-system','kube-public','kube-node-lease','gatekeeper-system'}
@@ -1863,9 +2163,15 @@ check_nodename_targeting() {
 
   # Identify control-plane / master nodes by label
   local master_nodes
-  master_nodes=$(kubectl get nodes -o json 2>/dev/null | python3 -c "
+  master_nodes=$(kctl get nodes -o json 2>/dev/null | python3 -c "
 import sys, json
-data = json.load(sys.stdin)
+try:
+    _raw = sys.stdin.read().strip()
+    data = json.loads(_raw) if _raw else {}
+except Exception:
+    data = {}
+if not isinstance(data, dict):
+    data = {}
 for n in data.get('items', []):
     labs = n.get('metadata',{}).get('labels', {})
     name = n.get('metadata',{}).get('name','')
@@ -1881,9 +2187,14 @@ for n in data.get('items', []):
 
   # Check all pods for explicit nodeName
   local _nn
-  _nn=$(kubectl get pods $NS_FLAG -o json 2>/dev/null | python3 -c "
+  _nn=$(kctl get pods $NS_FLAG -o json 2>/dev/null | python3 -c "
 import sys, json
-data  = json.load(sys.stdin)
+try:
+    _raw = sys.stdin.read().strip()
+    data = json.loads(_raw) if _raw else {}
+except Exception:
+    data = {}
+if not isinstance(data, dict): data = {}
 masters = set('''${master_nodes}'''.split())
 skip_ns = {'kube-system','kube-public','kube-node-lease'}
 
@@ -1916,9 +2227,15 @@ for pod in data.get('items', []):
   # ── Also check for pods that tolerate master taints ───────────────────────
   log "Checking for user pods tolerating control-plane/master taints..."
   local _mastertol
-  _mastertol=$(kubectl get pods $NS_FLAG -o json 2>/dev/null | python3 -c "
+  _mastertol=$(kctl get pods $NS_FLAG -o json 2>/dev/null | python3 -c "
 import sys, json
-data = json.load(sys.stdin)
+try:
+    _raw = sys.stdin.read().strip()
+    data = json.loads(_raw) if _raw else {}
+except Exception:
+    data = {}
+if not isinstance(data, dict):
+    data = {}
 master_taint_keys = {'node-role.kubernetes.io/master','node-role.kubernetes.io/control-plane'}
 skip_ns = {'kube-system','kube-public','kube-node-lease'}
 
@@ -1950,11 +2267,17 @@ check_egress_policies() {
 
   log "Checking namespaces for explicit egress NetworkPolicies..."
   local all_ns
-  all_ns=$(kubectl get namespaces -o jsonpath='{.items[*].metadata.name}' 2>/dev/null)
+  all_ns=$(kctl get namespaces -o jsonpath='{.items[*].metadata.name}' 2>/dev/null)
 
-  kubectl get networkpolicies $NS_FLAG -o json 2>/dev/null | python3 -c "
+  kctl get networkpolicies $NS_FLAG -o json 2>/dev/null | python3 -c "
 import sys, json
-data = json.load(sys.stdin)
+try:
+    _raw = sys.stdin.read().strip()
+    data = json.loads(_raw) if _raw else {}
+except Exception:
+    data = {}
+if not isinstance(data, dict):
+    data = {}
 skip_ns = {'kube-system','kube-public','kube-node-lease','gatekeeper-system'}
 
 # Build per-namespace egress coverage map
@@ -1994,9 +2317,15 @@ for ns in all_ns_list:
 
   # ── Check that DNS egress (port 53) is explicitly allowed where egress is denied ──
   log "Checking egress policies allow DNS (port 53) where egress is restricted..."
-  kubectl get networkpolicies $NS_FLAG -o json 2>/dev/null | python3 -c "
+  kctl get networkpolicies $NS_FLAG -o json 2>/dev/null | python3 -c "
 import sys, json
-data = json.load(sys.stdin)
+try:
+    _raw = sys.stdin.read().strip()
+    data = json.loads(_raw) if _raw else {}
+except Exception:
+    data = {}
+if not isinstance(data, dict):
+    data = {}
 skip_ns = {'kube-system','kube-public','kube-node-lease','gatekeeper-system'}
 
 for np in data.get('items', []):
@@ -2034,7 +2363,7 @@ print_summary() {
   echo -e "${BOLD}${BLUE}╔══════════════════════════════════════════════════════╗${RESET}"
   echo -e "${BOLD}${BLUE}║              SCAN COMPLETE — SUMMARY                ║${RESET}"
   echo -e "${BOLD}${BLUE}╠══════════════════════════════════════════════════════╣${RESET}"
-  printf "${BOLD}${BLUE}║${RESET}  %-28s %-24s${BOLD}${BLUE}║${RESET}\n" "Context:" "$(kubectl config current-context 2>/dev/null | cut -c1-24)"
+  printf "${BOLD}${BLUE}║${RESET}  %-28s %-24s${BOLD}${BLUE}║${RESET}\n" "Context:" "$(kctl config current-context 2>/dev/null | cut -c1-24)"
   printf "${BOLD}${BLUE}║${RESET}  %-28s %-24s${BOLD}${BLUE}║${RESET}\n" "Scope:" "$NS_LABEL"
   printf "${BOLD}${BLUE}║${RESET}  %-28s %-24s${BOLD}${BLUE}║${RESET}\n" "Timestamp:" "$(date -u '+%Y-%m-%d %H:%M UTC')"
   echo -e "${BOLD}${BLUE}╠══════════════════════════════════════════════════════╣${RESET}"
@@ -2052,7 +2381,7 @@ print_summary() {
     {
       printf "Kubernetes Vulnerability Scan Report\n"
       printf "=====================================\n"
-      printf "Context   : %s\n" "$(kubectl config current-context 2>/dev/null)"
+      printf "Context   : %s\n" "$(kctl config current-context 2>/dev/null)"
       printf "Scope     : %s\n" "$NS_LABEL"
       printf "Date      : %s\n" "$(date -u)"
       printf "\nCRITICAL : %s\n" "$CRITICAL_COUNT"
@@ -2071,7 +2400,7 @@ print_summary() {
 main() {
   echo -e "${BOLD}${CYAN}"
   echo "  ╔═══════════════════════════════════════════════════════╗"
-  echo "  ║     AKS VULNERABILITY SCANNER  —  kubectl native     ║"
+  echo "  ║     AKS VULNERABILITY SCANNER  —  kctl native     ║"
   echo "  ║       Critical & High Severity Findings Only          ║"
   echo "  ╚═══════════════════════════════════════════════════════╝"
   echo -e "${RESET}"
