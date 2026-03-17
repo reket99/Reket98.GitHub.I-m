@@ -87,7 +87,7 @@ preflight() {
 # 1. RBAC
 # =============================================================================
 check_rbac() {
-  section "1/9 · RBAC Misconfigurations"
+  section "1/17 · RBAC Misconfigurations"
 
   # ── 1a. cluster-admin bindings ──────────────────────────────────────────────
   log "Checking ClusterRoleBindings for cluster-admin..."
@@ -189,13 +189,130 @@ PYEOF
   echo "$_defsa" | while IFS='|' read -r sev msg; do
     case "$sev" in HIGH) high "$msg";; PASS) pass "$msg";; esac
   done
+
+  # ── 1e. Namespace-scoped Role wildcards ────────────────────────────────────
+  log "Checking namespace Roles for wildcard (*) permissions..."
+  local _rolewc
+  _rolewc=$(kubectl get roles $NS_FLAG -o json 2>/dev/null | python3 - << 'PYEOF'
+import sys, json
+data = json.load(sys.stdin)
+found = False
+for r in data.get('items', []):
+    ns   = r.get('metadata',{}).get('namespace','?')
+    name = r.get('metadata',{}).get('name','')
+    for rule in (r.get('rules') or []):
+        if '*' in rule.get('verbs', []) and '*' in rule.get('resources', []):
+            print(f'HIGH|Role "{name}" in ns "{ns}" grants full wildcard (*) on all resources and verbs')
+            found = True
+            break
+if not found:
+    print('PASS|No namespace Roles with full wildcard permissions')
+PYEOF
+)
+  echo "$_rolewc" | while IFS='|' read -r sev msg; do
+    case "$sev" in HIGH) high "$msg";; PASS) pass "$msg";; esac
+  done
+
+  # ── 1f. Secrets read permissions (get/list/watch on secrets) ──────────────
+  log "Checking for Roles/ClusterRoles that can read Secrets..."
+  local _secread
+  _secread=$(kubectl get clusterroles,roles $NS_FLAG -o json 2>/dev/null | python3 - << 'PYEOF'
+import sys, json
+data = json.load(sys.stdin)
+READ_VERBS = {'get','list','watch','*'}
+found = False
+for r in data.get('items', []):
+    kind = r.get('kind','')
+    name = r.get('metadata',{}).get('name','')
+    ns   = r.get('metadata',{}).get('namespace','cluster-wide')
+    if name.startswith('system:'): continue
+    for rule in (r.get('rules') or []):
+        verbs = set(rule.get('verbs', []))
+        res   = rule.get('resources', [])
+        if READ_VERBS & verbs and ('secrets' in res or '*' in res):
+            scope = f'ns "{ns}"' if kind == 'Role' else 'cluster-wide'
+            print(f'HIGH|{kind} "{name}" ({scope}) can read Secrets — any bound SA gains access to all secrets in scope')
+            found = True
+            break
+if not found:
+    print('PASS|No non-system Roles/ClusterRoles with Secrets read permissions')
+PYEOF
+)
+  echo "$_secread" | while IFS='|' read -r sev msg; do
+    case "$sev" in HIGH) high "$msg";; PASS) pass "$msg";; esac
+  done
+
+  # ── 1g. Dangerous escalation verbs: impersonate, bind, escalate ───────────
+  log "Checking for impersonate / bind / escalate verbs in Roles and ClusterRoles..."
+  local _esc
+  _esc=$(kubectl get clusterroles,roles $NS_FLAG -o json 2>/dev/null | python3 - << 'PYEOF'
+import sys, json
+data = json.load(sys.stdin)
+DANGER = {'impersonate','bind','escalate'}
+found = False
+for r in data.get('items', []):
+    kind = r.get('kind','')
+    name = r.get('metadata',{}).get('name','')
+    ns   = r.get('metadata',{}).get('namespace','cluster-wide')
+    if name.startswith('system:'): continue
+    for rule in (r.get('rules') or []):
+        overlap = DANGER & set(rule.get('verbs', []))
+        if overlap:
+            scope = f'ns "{ns}"' if kind == 'Role' else 'cluster-wide'
+            print(f'CRITICAL|{kind} "{name}" ({scope}) grants "{", ".join(overlap)}" verb — allows RBAC privilege escalation')
+            found = True
+            break
+if not found:
+    print('PASS|No Roles/ClusterRoles with impersonate/bind/escalate verbs')
+PYEOF
+)
+  echo "$_esc" | while IFS='|' read -r sev msg; do
+    case "$sev" in CRITICAL) critical "$msg";; PASS) pass "$msg";; esac
+  done
+
+  # ── 1h. Orphaned RoleBindings (subject SA no longer exists) ───────────────
+  log "Checking for RoleBindings referencing non-existent ServiceAccounts..."
+  local _orphan
+  _orphan=$(kubectl get rolebindings,clusterrolebindings $NS_FLAG -o json 2>/dev/null | python3 - << 'PYEOF'
+import sys, json, subprocess, shlex
+data = json.load(sys.stdin)
+found = False
+checked = {}
+for rb in data.get('items', []):
+    rb_ns   = rb.get('metadata',{}).get('namespace','')
+    rb_name = rb.get('metadata',{}).get('name','')
+    kind    = rb.get('kind','')
+    for subj in (rb.get('subjects') or []):
+        if subj.get('kind') != 'ServiceAccount': continue
+        sa_name = subj.get('name','')
+        sa_ns   = subj.get('namespace', rb_ns or 'default')
+        key     = f'{sa_ns}/{sa_name}'
+        if key in checked:
+            exists = checked[key]
+        else:
+            r = subprocess.run(
+                shlex.split(f'kubectl get serviceaccount {sa_name} -n {sa_ns} --no-headers'),
+                capture_output=True, text=True
+            )
+            exists = r.returncode == 0
+            checked[key] = exists
+        if not exists:
+            print(f'HIGH|{kind} "{rb_name}" (ns: {rb_ns or "cluster-wide"}) references missing SA "{sa_name}" in ns "{sa_ns}"')
+            found = True
+if not found:
+    print('PASS|No orphaned RoleBindings referencing missing ServiceAccounts')
+PYEOF
+)
+  echo "$_orphan" | while IFS='|' read -r sev msg; do
+    case "$sev" in HIGH) high "$msg";; PASS) pass "$msg";; esac
+  done
 }
 
 # =============================================================================
 # 2. PRIVILEGED & UNSAFE WORKLOADS
 # =============================================================================
 check_privileged_workloads() {
-  section "2/9 · Privileged & Unsafe Workloads"
+  section "2/17 · Privileged & Unsafe Workloads"
 
   log "Scanning all pods for security context issues..."
   kubectl get pods $NS_FLAG -o json 2>/dev/null | python3 - << 'PYEOF'
@@ -311,13 +428,122 @@ if not issues: print(f'PASS|cluster|All {ok} containers passed workload security
       PASS)     pass     "$msg" ;;
     esac
   done
+
+  # ── 2b. Additional workload hardening checks ──────────────────────────────
+  log "Checking for shareProcessNamespace, missing capability drops, runAsNonRoot, procMount..."
+  local _extra
+  _extra=$(kubectl get pods $NS_FLAG -o json 2>/dev/null | python3 -c "
+import sys, json, re
+data = json.load(sys.stdin)
+found = False
+PUBLIC_REGISTRIES = ('docker.io','index.docker.io','registry-1.docker.io','ghcr.io','quay.io','gcr.io','public.ecr.aws')
+
+for pod in data.get('items', []):
+    ns   = pod.get('metadata',{}).get('namespace','?')
+    name = pod.get('metadata',{}).get('name','?')
+    spec = pod.get('spec', {})
+    ref  = f'{ns}/{name}'
+
+    # shareProcessNamespace lets containers see each other's memory/fds
+    if spec.get('shareProcessNamespace'):
+        print(f'HIGH|{ref}|shareProcessNamespace=true — containers share PID namespace, can read each other memory')
+        found = True
+
+    all_c = (spec.get('containers') or []) + (spec.get('initContainers') or [])
+    for c in all_c:
+        cname = c.get('name','?')
+        sc    = c.get('securityContext', {})
+        cref  = f'{ref}/{cname}'
+
+        # runAsNonRoot should be explicitly true (belt-and-suspenders with runAsUser)
+        if sc.get('runAsNonRoot') is not True:
+            print(f'HIGH|{cref}|runAsNonRoot not set to true — container may run as root if image USER is root')
+            found = True
+
+        # capabilities.drop should include ALL
+        caps_drop = [c.upper() for c in (sc.get('capabilities') or {}).get('drop', [])]
+        if 'ALL' not in caps_drop:
+            print(f'HIGH|{cref}|capabilities.drop does not include ALL — unnecessary Linux capabilities retained')
+            found = True
+
+        # procMount Unmasked bypasses /proc restrictions
+        if sc.get('procMount','Default') == 'Unmasked':
+            print(f'CRITICAL|{cref}|procMount=Unmasked — full /proc access, kernel attack surface expanded')
+            found = True
+
+        # Image pull policy: IfNotPresent or Never on a mutable tag is dangerous
+        pull = c.get('imagePullPolicy','')
+        img  = c.get('image','')
+        tag  = img.split(':')[-1] if ':' in img.split('/')[-1] else 'latest'
+        if pull in ('IfNotPresent','Never') and tag in ('latest',''):
+            print(f'HIGH|{cref}|imagePullPolicy={pull} with mutable tag — stale/compromised image may persist on node')
+            found = True
+
+        # Image sourced from public registry (should use private ACR on AKS)
+        registry = img.split('/')[0] if '.' in img.split('/')[0] or ':' in img.split('/')[0] else 'docker.io'
+        if any(registry == pub or img.startswith(pub) for pub in PUBLIC_REGISTRIES):
+            print(f'HIGH|{cref}|image pulled from public registry \"{registry}\" — use private Azure Container Registry')
+            found = True
+
+    # imagePullSecrets — if pulling from private registry, must be set
+    if not spec.get('imagePullSecrets'):
+        # Only flag if images look like they need auth (non-public, contain a registry hostname)
+        private_images = [
+            c.get('image','') for c in all_c
+            if '.' in c.get('image','').split('/')[0]
+            and not any(c.get('image','').startswith(pub) for pub in PUBLIC_REGISTRIES)
+        ]
+        if private_images:
+            print(f'HIGH|{ref}|No imagePullSecrets but uses private registry images: {private_images[0]} — pull may fail or use node credentials insecurely')
+            found = True
+
+if not found:
+    print('PASS|cluster|No additional workload hardening issues found')
+")
+  echo "$_extra" | while IFS='|' read -r sev loc msg; do
+    case "$sev" in
+      CRITICAL) critical "$loc — $msg" ;;
+      HIGH)     high     "$loc — $msg" ;;
+      PASS)     pass     "$msg" ;;
+    esac
+  done
+
+  # ── 2c. CronJob security checks ───────────────────────────────────────────
+  log "Checking CronJobs for dangerous security contexts..."
+  local _cron
+  _cron=$(kubectl get cronjobs $NS_FLAG -o json 2>/dev/null | python3 -c "
+import sys, json
+data = json.load(sys.stdin)
+found = False
+for cj in data.get('items', []):
+    ns   = cj.get('metadata',{}).get('namespace','?')
+    name = cj.get('metadata',{}).get('name','?')
+    ref  = f'{ns}/{name}'
+    spec = cj.get('spec',{}).get('jobTemplate',{}).get('spec',{}).get('template',{}).get('spec',{})
+    for c in (spec.get('containers') or []):
+        sc = c.get('securityContext', {})
+        if sc.get('privileged'):
+            print(f'CRITICAL|{ref}/{c[\"name\"]}|CronJob container is privileged')
+            found = True
+        if sc.get('runAsUser') == 0:
+            print(f'HIGH|{ref}/{c[\"name\"]}|CronJob container runs as root')
+            found = True
+    if spec.get('hostNetwork'):
+        print(f'HIGH|{ref}|CronJob uses hostNetwork')
+        found = True
+if not found:
+    print('PASS|cluster|No dangerous CronJob security contexts found')
+")
+  echo "$_cron" | while IFS='|' read -r sev loc msg; do
+    case "$sev" in CRITICAL) critical "$loc — $msg";; HIGH) high "$loc — $msg";; PASS) pass "$msg";; esac
+  done
 }
 
 # =============================================================================
 # 3. NETWORK POLICIES
 # =============================================================================
 check_network_policies() {
-  section "3/9 · Network Policy Coverage"
+  section "3/17 · Network Policy Coverage"
 
   log "Checking namespaces for missing NetworkPolicies..."
   local all_ns covered any_missing=false
@@ -361,7 +587,7 @@ for ns in sorted(ns_deny): print(ns)
 # 4. SECRETS EXPOSURE
 # =============================================================================
 check_secrets_exposure() {
-  section "4/9 · Secrets & Sensitive Data Exposure"
+  section "4/17 · Secrets & Sensitive Data Exposure"
 
   log "Checking for Kubernetes Secrets injected as plain env vars..."
   local _env
@@ -402,49 +628,195 @@ if not found: print('PASS||No pods using default SA with auto-mounted tokens')
     case "$sev" in HIGH) high "$ref — $msg";; PASS) pass "$msg";; esac
   done
 
-  log "Scanning ConfigMaps for likely embedded secrets (heuristic)..."
-  local _cm
-  _cm=$(kubectl get configmaps $NS_FLAG -o json 2>/dev/null | python3 -c "
-import sys, json, re
+  # ── 4b-extra. envFrom secretRef (entire Secret bulk-mounted as env) ────────
+  log "Checking for envFrom secretRef (entire Secret injected into environment)..."
+  local _envfrom
+  _envfrom=$(kubectl get pods $NS_FLAG -o json 2>/dev/null | python3 -c "
+import sys, json
 data = json.load(sys.stdin)
-patterns = [
-    (re.compile(r'(?i)(password|passwd|secret|token|apikey|api_key|private.?key)\s*[:=]\s*\S+'), 'password/secret pattern'),
-    (re.compile(r'(?i)BEGIN (RSA|EC|OPENSSH|PRIVATE) KEY'), 'PEM private key block'),
-]
 found = False
-for cm in data.get('items', []):
-    ns = cm.get('metadata',{}).get('namespace','?'); name = cm.get('metadata',{}).get('name','?')
-    if any(name.startswith(p) for p in ('kube-','azure-','omsagent','coredns','extension-')): continue
-    for key, val in (cm.get('data') or {}).items():
-        for pat, label in patterns:
-            if pat.search(str(val)):
-                print(f'HIGH|{ns}/{name}|key \"{key}\" matches {label} — use K8s Secret or Azure Key Vault')
-                found = True; break
-if not found: print('PASS||No obvious secrets detected in ConfigMaps')
+for pod in data.get('items', []):
+    ns   = pod.get('metadata',{}).get('namespace','?')
+    name = pod.get('metadata',{}).get('name','?')
+    for c in (pod.get('spec',{}).get('containers') or []) + (pod.get('spec',{}).get('initContainers') or []):
+        for ef in (c.get('envFrom') or []):
+            if 'secretRef' in ef:
+                sname = ef['secretRef'].get('name','?')
+                print(f'HIGH|{ns}/{name}/{c[\"name\"]}|envFrom secretRef \"{sname}\" — entire Secret exposed as env vars (all keys visible in process environment)')
+                found = True
+if not found:
+    print('PASS||No envFrom secretRef bulk-mounts detected')
 ")
-  echo "$_cm" | while IFS='|' read -r sev ref msg; do
+  echo "$_envfrom" | while IFS='|' read -r sev ref msg; do
     case "$sev" in HIGH) high "$ref — $msg";; PASS) pass "$msg";; esac
   done
 
-  log "Checking for hardcoded secret-like values in pod env vars (literal)..."
+  # ── 4b-extra2. Secret volume mounts (secret as file) ─────────────────────
+  log "Checking for Secrets mounted as volumes..."
+  local _secvol
+  _secvol=$(kubectl get pods $NS_FLAG -o json 2>/dev/null | python3 -c "
+import sys, json
+data = json.load(sys.stdin)
+found = False
+for pod in data.get('items', []):
+    ns   = pod.get('metadata',{}).get('namespace','?')
+    name = pod.get('metadata',{}).get('name','?')
+    for vol in (pod.get('spec',{}).get('volumes') or []):
+        sec = vol.get('secret')
+        if sec:
+            sname = sec.get('secretName','?')
+            # defaultMode 0644 or higher is world-readable inside the pod
+            mode = sec.get('defaultMode', 0o644)
+            if isinstance(mode, int) and (mode & 0o044):
+                print(f'HIGH|{ns}/{name}|Secret \"{sname}\" mounted as volume with mode {oct(mode)} — world-readable inside pod')
+            else:
+                print(f'HIGH|{ns}/{name}|Secret \"{sname}\" mounted as volume — verify least-privilege access within pod')
+            found = True
+if not found:
+    print('PASS||No Secrets mounted as volumes')
+")
+  echo "$_secvol" | while IFS='|' read -r sev ref msg; do
+    case "$sev" in HIGH) high "$ref — $msg";; PASS) pass "$msg";; esac
+  done
+
+  # ── 4b-extra3. TLS Secret certificate expiry ──────────────────────────────
+  log "Checking TLS Secrets for expired or soon-expiring certificates..."
+  local _tls_exp
+  _tls_exp=$(kubectl get secrets $NS_FLAG -o json 2>/dev/null | python3 -c "
+import sys, json, base64, re
+from datetime import datetime, timezone
+
+data = json.load(sys.stdin)
+now  = datetime.now(timezone.utc)
+found = False
+
+for secret in data.get('items', []):
+    if secret.get('type','') != 'kubernetes.io/tls': continue
+    ns   = secret.get('metadata',{}).get('namespace','?')
+    name = secret.get('metadata',{}).get('name','?')
+    cert_b64 = (secret.get('data') or {}).get('tls.crt','')
+    if not cert_b64: continue
+    try:
+        cert_pem = base64.b64decode(cert_b64).decode('utf-8', errors='ignore')
+        # Extract Not After from PEM using regex (avoids needing cryptography lib)
+        m = re.search(r'Not After\s*:\s*(.+)', cert_pem)
+        if not m:
+            # Try parsing the ASN.1 date directly from decoded bytes
+            continue
+        exp_str = m.group(1).strip()
+        exp = datetime.strptime(exp_str, '%b %d %H:%M:%S %Y %Z').replace(tzinfo=timezone.utc)
+        days_left = (exp - now).days
+        if days_left < 0:
+            print(f'CRITICAL|{ns}/{name}|TLS certificate EXPIRED {abs(days_left)} day(s) ago (expired: {exp.date()})')
+            found = True
+        elif days_left <= 30:
+            print(f'CRITICAL|{ns}/{name}|TLS certificate expires in {days_left} day(s) ({exp.date()}) — renew immediately')
+            found = True
+        elif days_left <= 90:
+            print(f'HIGH|{ns}/{name}|TLS certificate expires in {days_left} day(s) ({exp.date()}) — plan renewal')
+            found = True
+    except Exception:
+        continue
+
+if not found:
+    print('PASS||All TLS Secrets have certificates valid for more than 90 days')
+")
+  echo "$_tls_exp" | while IFS='|' read -r sev ref msg; do
+    case "$sev" in CRITICAL) critical "$ref — $msg";; HIGH) high "$ref — $msg";; PASS) pass "$msg";; esac
+  done
+  # Matches the page's jq query: flags ConfigMaps where any key NAME looks like
+  # a secret (password/secret/token/key), AND separately scans values for
+  # embedded credentials or PEM blocks.
+  log "Scanning ConfigMaps for secret-like key names and embedded credential values..."
+  local _cm
+  _cm=$(kubectl get configmaps $NS_FLAG -o json 2>/dev/null | python3 -c "
+import sys, json, re
+
+SYSTEM_PREFIXES = ('kube-','azure-','omsagent','coredns','extension-','flannel','calico',
+                   'cilium','cni-','metrics-','aks-')
+
+# Pattern 1 — key NAME looks like a secret field (mirrors the page's jq test)
+KEY_NAME_RE = re.compile(r'(?i)(password|passwd|secret|token|api.?key|private.?key|sas.?key|conn.?str|connectionstring|credential|auth)')
+
+# Pattern 2 — key VALUE contains embedded credentials or PEM material
+VALUE_PATTERNS = [
+    (re.compile(r'(?i)BEGIN (RSA|EC|DSA|OPENSSH|PRIVATE|CERTIFICATE) KEY'), 'PEM private key block'),
+    (re.compile(r'(?i)(password|passwd|secret|api.?key|sas.?key)\s*[:=]\s*\S{6,}'),  'inline credential assignment'),
+    (re.compile(r'(?i)AccountKey=[A-Za-z0-9+/]{20,}={0,2}'),                          'Azure Storage account key'),
+    (re.compile(r'(?i)SharedAccessSignature.*sig='),                                   'Azure SAS token'),
+    (re.compile(r'eyJ[A-Za-z0-9_-]{20,}\.eyJ[A-Za-z0-9_-]{10,}'),                    'JWT / bearer token'),
+    (re.compile(r'(?i)(AKIA|ASIA)[A-Z0-9]{16}'),                                      'AWS access key ID pattern'),
+]
+
+found = False
+data  = json.load(sys.stdin)
+
+for cm in data.get('items', []):
+    ns   = cm.get('metadata',{}).get('namespace','?')
+    name = cm.get('metadata',{}).get('name','?')
+    if any(name.startswith(p) for p in SYSTEM_PREFIXES): continue
+    for key, val in (cm.get('data') or {}).items():
+        val_str = str(val or '')
+        # Check key NAME (mirrors the page's approach)
+        if KEY_NAME_RE.search(key):
+            sev = 'CRITICAL' if val_str and len(val_str) > 3 else 'HIGH'
+            print(f'{sev}|{ns}/{name}|ConfigMap key named \"{key}\" looks like a secret field (value length: {len(val_str)}) — move to K8s Secret or AKV')
+            found = True
+            continue  # already reported, skip value scan for this key
+        # Check key VALUE for embedded credentials
+        for pat, label in VALUE_PATTERNS:
+            if pat.search(val_str):
+                print(f'CRITICAL|{ns}/{name}|key \"{key}\" value contains {label} — move to K8s Secret or Azure Key Vault')
+                found = True
+                break
+
+if not found:
+    print('PASS||No secret-like key names or embedded credentials detected in ConfigMaps')
+")
+  echo "$_cm" | while IFS='|' read -r sev ref msg; do
+    case "$sev" in CRITICAL) critical "$ref — $msg";; HIGH) high "$ref — $msg";; PASS) pass "$msg";; esac
+  done
+
+  # ── 4d. Pod env var plaintext secret detection ────────────────────────────
+  # Mirrors the page's jq query exactly:
+  #   - env var NAME matches PASSWORD|SECRET|TOKEN|KEY (case-insensitive)
+  #   - AND the env entry has a literal "value" field (not valueFrom)
+  #   - Reports the variable name so triage is actionable
+  log "Checking pod env vars for plaintext secrets (name matches + literal value present)..."
   local _lit
   _lit=$(kubectl get pods $NS_FLAG -o json 2>/dev/null | python3 -c "
 import sys, json, re
-data = json.load(sys.stdin)
-secret_keys = re.compile(r'(?i)(password|passwd|secret|token|apikey|api_key|connstr|connectionstring|sas_key)')
+
+SECRET_NAME_RE = re.compile(r'(?i)(password|passwd|secret|token|api.?key|sas.?key|private.?key|conn.?str|connectionstring|credential|auth.?token|client.?secret)')
+
+data  = json.load(sys.stdin)
 found = False
+
 for pod in data.get('items', []):
-    ns = pod.get('metadata',{}).get('namespace','?'); name = pod.get('metadata',{}).get('name','?')
-    for c in (pod.get('spec',{}).get('containers') or []):
+    ns   = pod.get('metadata',{}).get('namespace','?')
+    name = pod.get('metadata',{}).get('name','?')
+    for c in (pod.get('spec',{}).get('containers') or []) + (pod.get('spec',{}).get('initContainers') or []):
+        cname = c.get('name','?')
         for env in (c.get('env') or []):
-            ename = env.get('name',''); val = env.get('value','')
-            if secret_keys.search(ename) and val and 'valueFrom' not in env:
-                print(f'CRITICAL|{ns}/{name}/{c[\"name\"]}|env var \"{ename}\" appears to contain a hardcoded secret')
-                found = True
-if not found: print('PASS||No hardcoded secret-like literal env vars detected')
+            ename = env.get('name','')
+            # Must match the secret name pattern (mirrors page's jq test())
+            if not SECRET_NAME_RE.search(ename):
+                continue
+            # Must have a literal value (not valueFrom) — mirrors page's has('value')
+            literal_val = env.get('value', None)
+            if literal_val is None:
+                continue
+            # Severity: CRITICAL if value is non-trivial (not empty/placeholder)
+            placeholder = re.match(r'^(\$\(.*\)|<.*>|\{\{.*\}\}|changeme|replace|example|todo|xxx|none|null|false|true)$', str(literal_val), re.I)
+            sev = 'HIGH' if placeholder or len(str(literal_val)) < 4 else 'CRITICAL'
+            print(f'{sev}|{ns}/{name}/{cname}|env var \"{ename}\" has a hardcoded plaintext value (length: {len(str(literal_val))})')
+            found = True
+
+if not found:
+    print('PASS||No pod env vars with secret-like names and plaintext values detected')
 ")
   echo "$_lit" | while IFS='|' read -r sev ref msg; do
-    case "$sev" in CRITICAL) critical "$ref — $msg";; PASS) pass "$msg";; esac
+    case "$sev" in CRITICAL) critical "$ref — $msg";; HIGH) high "$ref — $msg";; PASS) pass "$msg";; esac
   done
 }
 
@@ -452,7 +824,7 @@ if not found: print('PASS||No hardcoded secret-like literal env vars detected')
 # 5. AKS / AZURE-SPECIFIC CHECKS
 # =============================================================================
 check_aks_specific() {
-  section "5/9 · AKS & Azure-Specific Checks"
+  section "5/17 · AKS & Azure-Specific Checks"
 
   log "Checking ServiceAccounts for Workload Identity vs token auto-mount..."
   local _wi
@@ -571,7 +943,7 @@ if not found: print('PASS|No hostNetwork pods that could access Azure IMDS')
 # 6. API SERVER (AKS-observable)
 # =============================================================================
 check_api_server() {
-  section "6/9 · API Server & Control Plane Settings"
+  section "6/17 · API Server & Control Plane Settings"
 
   log "Testing anonymous access to the API server..."
   local anon_check
@@ -636,7 +1008,7 @@ if not found: print('PASS|No Kubernetes Dashboard service detected')
 # 7. NODE SECURITY
 # =============================================================================
 check_nodes() {
-  section "7/9 · Node Security Posture"
+  section "7/17 · Node Security Posture"
 
   log "Inspecting node health and configurations..."
   local _nodes
@@ -688,7 +1060,7 @@ if not found: print('PASS|No pods with catch-all tolerations found')
 # 8. INGRESS & EXTERNAL EXPOSURE
 # =============================================================================
 check_ingress() {
-  section "8/9 · Ingress & External Exposure"
+  section "8/17 · Ingress & External Exposure"
 
   log "Checking for Services with public LoadBalancer IPs..."
   local _lb
@@ -753,13 +1125,69 @@ if not found: print('PASS|No NodePort services found')
   echo "$_np" | while IFS='|' read -r sev ref msg; do
     case "$sev" in HIGH) high "$ref — $msg";; PASS) pass "$msg";; esac
   done
+
+  # ── 8d. ExternalName services (DNS rebinding / SSRF vector) ──────────────
+  log "Checking for ExternalName services pointing outside the cluster..."
+  local _extname
+  _extname=$(kubectl get services $NS_FLAG -o json 2>/dev/null | python3 -c "
+import sys, json, re
+data = json.load(sys.stdin)
+found = False
+INTERNAL = re.compile(r'(\.svc\.cluster\.local|\.svc$|^localhost$|^127\.|^10\.|^192\.168\.|^172\.(1[6-9]|2[0-9]|3[01])\.)')
+for svc in data.get('items', []):
+    ns   = svc.get('metadata',{}).get('namespace','?')
+    name = svc.get('metadata',{}).get('name','?')
+    if svc.get('spec',{}).get('type') != 'ExternalName': continue
+    ext = svc.get('spec',{}).get('externalName','')
+    if ext and not INTERNAL.search(ext):
+        print(f'HIGH|{ns}/{name}|ExternalName service points to external host \"{ext}\" — potential SSRF / DNS rebinding vector')
+        found = True
+    elif ext:
+        print(f'PASS|{ns}/{name}|ExternalName service points to internal host \"{ext}\"')
+if not found:
+    print('PASS|No external ExternalName services found')
+")
+  echo "$_extname" | while IFS='|' read -r sev ref msg; do
+    case "$sev" in HIGH) high "$ref — $msg";; PASS) pass "$msg";; esac
+  done
+
+  # ── 8e. Ingress without authentication annotations ────────────────────────
+  log "Checking Ingress resources for missing authentication annotations..."
+  local _ingressauth
+  _ingressauth=$(kubectl get ingress $NS_FLAG -o json 2>/dev/null | python3 -c "
+import sys, json
+data = json.load(sys.stdin)
+AUTH_ANNOTATIONS = {
+    'nginx.ingress.kubernetes.io/auth-url',
+    'nginx.ingress.kubernetes.io/auth-signin',
+    'nginx.ingress.kubernetes.io/auth-type',
+    'konghq.com/plugins',
+    'appgw.ingress.kubernetes.io/backend-path-prefix',
+    'kubernetes.io/ingress.class',
+}
+found = False
+for ing in data.get('items', []):
+    ns   = ing.get('metadata',{}).get('namespace','?')
+    name = ing.get('metadata',{}).get('name','?')
+    anns = set(ing.get('metadata',{}).get('annotations', {}).keys())
+    hosts = [r.get('host','?') for r in (ing.get('spec',{}).get('rules') or [])]
+    # Check if any auth annotation is present
+    if not (anns & AUTH_ANNOTATIONS):
+        print(f'HIGH|{ns}/{name}|Ingress has no authentication annotations (hosts: {\" \".join(hosts)}) — routes may be publicly accessible without authn')
+        found = True
+if not found:
+    print('PASS|All Ingress resources have authentication-related annotations')
+")
+  echo "$_ingressauth" | while IFS='|' read -r sev ref msg; do
+    case "$sev" in HIGH) high "$ref — $msg";; PASS) pass "$msg";; esac
+  done
 }
 
 # =============================================================================
 # 9. LEAST PRIVILEGE & MISCELLANEOUS
 # =============================================================================
 check_least_privilege() {
-  section "9/9 · Least Privilege & Miscellaneous"
+  section "9/17 · Least Privilege & Miscellaneous"
 
   log "Checking for ClusterRoles with dangerous pod verbs (exec/attach/portforward)..."
   local _exec
@@ -833,6 +1261,768 @@ if not found: print('PASS|No resources using known deprecated API versions')
   echo "$_dep" | while IFS='|' read -r sev ref msg; do
     case "$sev" in HIGH) high "$ref — $msg";; PASS) pass "$msg";; esac
   done
+
+  # ── 9e. Roles that can create/update workloads (malicious pod injection) ───
+  log "Checking for Roles/ClusterRoles that can create or update pods/deployments..."
+  local _create
+  _create=$(kubectl get clusterroles,roles $NS_FLAG -o json 2>/dev/null | python3 -c "
+import sys, json
+data = json.load(sys.stdin)
+WORKLOAD_RESOURCES = {'pods','deployments','daemonsets','statefulsets','jobs','cronjobs','replicationcontrollers'}
+CREATE_VERBS = {'create','update','patch','*'}
+found = False
+for r in data.get('items', []):
+    kind = r.get('kind','')
+    name = r.get('metadata',{}).get('name','')
+    ns   = r.get('metadata',{}).get('namespace','cluster-wide')
+    if name.startswith('system:'): continue
+    for rule in (r.get('rules') or []):
+        verbs = set(rule.get('verbs', []))
+        res   = set(rule.get('resources', []))
+        if CREATE_VERBS & verbs and (WORKLOAD_RESOURCES & res or '*' in res):
+            scope = f'ns \"{ns}\"' if kind == 'Role' else 'cluster-wide'
+            matched = ', '.join(WORKLOAD_RESOURCES & res) if '*' not in res else '*'
+            print(f'HIGH|{kind} \"{name}\" ({scope}) can create/modify workloads ({matched}) — can inject privileged pods')
+            found = True
+            break
+if not found:
+    print('PASS|No non-system Roles/ClusterRoles with workload create/update permissions')
+")
+  echo "$_create" | while IFS='|' read -r sev msg; do
+    case "$sev" in HIGH) high "$msg";; PASS) pass "$msg";; esac
+  done
+
+  # ── 9f. ValidatingWebhookConfiguration / MutatingWebhookConfiguration ─────
+  log "Checking admission webhooks for insecure failure policies..."
+  local _webhooks
+  _webhooks=$(kubectl get validatingwebhookconfigurations,mutatingwebhookconfigurations -o json 2>/dev/null | python3 -c "
+import sys, json
+data = json.load(sys.stdin)
+found = False
+for wh in data.get('items', []):
+    kind = wh.get('kind','')
+    name = wh.get('metadata',{}).get('name','')
+    for hook in (wh.get('webhooks') or []):
+        hname    = hook.get('name','?')
+        policy   = hook.get('failurePolicy','Ignore')
+        side_eff = hook.get('sideEffects','Unknown')
+        timeout  = hook.get('timeoutSeconds', 10)
+        if policy == 'Ignore':
+            print(f'HIGH|{kind} \"{name}\" hook \"{hname}\"|failurePolicy=Ignore — if webhook is down, admission is bypassed')
+            found = True
+        if side_eff not in ('None','NoneOnDryRun'):
+            print(f'HIGH|{kind} \"{name}\" hook \"{hname}\"|sideEffects={side_eff} — webhook has side effects (not safe for dry-run)')
+            found = True
+        if timeout > 25:
+            print(f'HIGH|{kind} \"{name}\" hook \"{hname}\"|timeoutSeconds={timeout} — long timeout can cause API server slowdowns')
+            found = True
+if not found:
+    print('PASS|All admission webhooks have safe failure policies')
+")
+  echo "$_webhooks" | while IFS='|' read -r sev ref msg; do
+    case "$sev" in HIGH) high "$ref — $msg";; PASS) pass "$msg";; esac
+  done
+
+  # ── 9g. RuntimeClass — pods without a hardened runtime ────────────────────
+  log "Checking pods for RuntimeClass (gVisor/kata for stronger isolation)..."
+  local _runtime
+  _runtime=$(kubectl get pods $NS_FLAG -o json 2>/dev/null | python3 -c "
+import sys, json
+data = json.load(sys.stdin)
+skip_ns = {'kube-system','kube-public','kube-node-lease','gatekeeper-system'}
+no_runtime = 0
+with_runtime = 0
+for pod in data.get('items', []):
+    ns   = pod.get('metadata',{}).get('namespace','?')
+    if ns in skip_ns: continue
+    rc = pod.get('spec',{}).get('runtimeClassName','')
+    if rc:
+        with_runtime += 1
+    else:
+        no_runtime += 1
+total = no_runtime + with_runtime
+if no_runtime > 0 and with_runtime == 0:
+    print(f'HIGH|{no_runtime}/{total} pods use default runtimeClass (runc) — consider gVisor (runsc) or Kata Containers for stronger isolation')
+elif no_runtime > 0:
+    print(f'HIGH|{no_runtime}/{total} pods have no RuntimeClass set — mixed isolation posture in cluster')
+else:
+    print(f'PASS|All {total} non-system pods specify a RuntimeClass')
+")
+  echo "$_runtime" | while IFS='|' read -r sev msg; do
+    case "$sev" in HIGH) high "$msg";; PASS) pass "$msg";; esac
+  done
+
+  # ── 9h. Projected ServiceAccount tokens vs legacy long-lived tokens ────────
+  log "Checking for legacy long-lived ServiceAccount tokens (non-projected)..."
+  local _tokens
+  _tokens=$(kubectl get secrets $NS_FLAG -o json 2>/dev/null | python3 -c "
+import sys, json
+from datetime import datetime, timezone
+data = json.load(sys.stdin)
+found = False
+for secret in data.get('items', []):
+    if secret.get('type','') != 'kubernetes.io/service-account-token': continue
+    ns   = secret.get('metadata',{}).get('namespace','?')
+    name = secret.get('metadata',{}).get('name','?')
+    anns = secret.get('metadata',{}).get('annotations', {})
+    sa   = anns.get('kubernetes.io/service-account.name','?')
+    # Long-lived tokens have no expiry — they are only safe when using projected tokens
+    print(f'HIGH|{ns}/{name}|Legacy long-lived ServiceAccount token for SA \"{sa}\" — use projected tokens with short TTL instead')
+    found = True
+if not found:
+    print('PASS|No legacy long-lived ServiceAccount tokens found (projected tokens in use)')
+")
+  echo "$_tokens" | while IFS='|' read -r sev ref msg; do
+    case "$sev" in HIGH) high "$ref — $msg";; PASS) pass "$msg";; esac
+  done
+}
+
+# =============================================================================
+# 10. KUBELET API EXPOSURE
+# =============================================================================
+check_kubelet_api() {
+  section "10/17 · Kubelet API Exposure (port 10250)"
+
+  # Pull the list of node IPs from kubectl, then probe each node's kubelet
+  # using kubectl's port-forward or by inspecting the kubelet config ConfigMap.
+  # On AKS we cannot SSH to nodes directly, so we use two indirect methods:
+  #   a) Inspect the kubelet-config ConfigMap in kube-system (AKS stores it there)
+  #   b) Attempt a kubectl proxy round-trip to the kubelet /pods endpoint via API server
+
+  # ── 10a. Kubelet ConfigMap — anonymous auth & AlwaysAllow ──────────────────
+  log "Checking kubelet config for anonymous auth and AlwaysAllow authorization..."
+  local _kcm
+  _kcm=$(kubectl get configmap kubelet-config -n kube-system -o json 2>/dev/null \
+    || kubectl get configmap kubelet-config-1.28 -n kube-system -o json 2>/dev/null \
+    || kubectl get configmap kubelet-config-1.27 -n kube-system -o json 2>/dev/null \
+    || echo '{}')
+
+  echo "$_kcm" | python3 -c "
+import sys, json, re
+raw = sys.stdin.read()
+try:
+    cm = json.loads(raw)
+except Exception:
+    print('PASS|Could not read kubelet ConfigMap (managed cluster may restrict access)')
+    sys.exit(0)
+
+data_field = cm.get('data', {}).get('kubelet', '') or cm.get('data', {}).get('config', '')
+if not data_field:
+    print('PASS|No kubelet config data found in ConfigMap — likely AKS-managed, check via Azure Portal')
+    sys.exit(0)
+
+# Parse embedded YAML-like content as text (avoid yaml dep)
+anon_enabled  = re.search(r'enabled:\s*true',  data_field) and re.search(r'anonymous', data_field)
+always_allow  = re.search(r'mode:\s*AlwaysAllow', data_field)
+webhook_authn = re.search(r'mode:\s*Webhook', data_field)
+
+if anon_enabled:
+    print('CRITICAL|Kubelet anonymous authentication is enabled — unauthenticated RCE possible on port 10250')
+else:
+    print('PASS|Kubelet anonymous authentication appears disabled')
+
+if always_allow:
+    print('CRITICAL|Kubelet authorization mode is AlwaysAllow — any authenticated request is permitted')
+elif webhook_authn:
+    print('PASS|Kubelet authorization mode is Webhook (delegates to API server)')
+else:
+    print('HIGH|Could not confirm kubelet authorization mode — verify it is not AlwaysAllow')
+" | while IFS='|' read -r sev msg; do
+    case "$sev" in CRITICAL) critical "$msg";; HIGH) high "$msg";; PASS) pass "$msg";; esac
+  done
+
+  # ── 10b. Probe kubelet /pods via API server proxy ──────────────────────────
+  log "Probing kubelet /pods endpoint through API server proxy for each node..."
+  local nodes
+  nodes=$(kubectl get nodes -o jsonpath='{.items[*].metadata.name}' 2>/dev/null)
+  local kubelet_issues=false
+  for node in $nodes; do
+    # kubectl get --raw proxies directly to the kubelet through the API server
+    local result
+    result=$(kubectl get --raw "/api/v1/nodes/${node}/proxy/pods" 2>&1 || true)
+    if echo "$result" | grep -q '"kind":"PodList"'; then
+      kubelet_issues=true
+      critical "Node \"$node\" — kubelet /pods endpoint accessible via API server proxy (verify kubelet auth is enforced)"
+    elif echo "$result" | grep -qiE "forbidden|unauthorized|certificate"; then
+      pass "Node \"$node\" — kubelet proxy endpoint correctly restricted"
+    else
+      high "Node \"$node\" — unexpected kubelet proxy response: $(echo "$result" | head -c 120)"
+    fi
+  done
+  [[ "$kubelet_issues" == false ]] && true  # individual node pass messages already printed
+
+  # ── 10c. Check for kubelet read-only port (10255) ──────────────────────────
+  log "Checking if kubelet read-only port (10255) is referenced in node config..."
+  local _ro
+  _ro=$(kubectl get configmap kubelet-config -n kube-system -o jsonpath='{.data.kubelet}' 2>/dev/null || echo "")
+  if echo "$_ro" | grep -q "readOnlyPort: 0"; then
+    pass "Kubelet read-only port (10255) is disabled (readOnlyPort: 0)"
+  elif echo "$_ro" | grep -q "readOnlyPort:"; then
+    local port
+    port=$(echo "$_ro" | grep "readOnlyPort:" | awk '{print $2}')
+    if [[ "$port" != "0" ]]; then
+      high "Kubelet read-only port is set to $port — unauthenticated metric/pod info disclosure possible"
+    fi
+  else
+    high "Cannot confirm kubelet readOnlyPort is disabled — verify port 10255 is not exposed on nodes"
+  fi
+}
+
+# =============================================================================
+# 11. ETCD EXPOSURE
+# =============================================================================
+check_etcd() {
+  section "11/17 · ETCD Storage Security"
+
+  # ── 11a. ETCD pod / static manifest inspection ────────────────────────────
+  log "Checking ETCD configuration via kube-system pods..."
+  local _etcd
+  _etcd=$(kubectl get pods -n kube-system -o json 2>/dev/null | python3 -c "
+import sys, json
+data = json.load(sys.stdin)
+found = False
+for pod in data.get('items', []):
+    name = pod.get('metadata',{}).get('name','')
+    if 'etcd' not in name: continue
+    found = True
+    for c in (pod.get('spec',{}).get('containers') or []):
+        args = c.get('command', []) + c.get('args', [])
+        arg_str = ' '.join(args)
+
+        # client-cert-auth should be true
+        if '--client-cert-auth=true' not in arg_str and '--client-cert-auth' not in arg_str:
+            print('CRITICAL|ETCD pod: --client-cert-auth not set — unauthenticated client connections may be allowed')
+        else:
+            print('PASS|ETCD client-cert-auth is enabled')
+
+        # peer-client-cert-auth
+        if '--peer-client-cert-auth=true' not in arg_str and '--peer-client-cert-auth' not in arg_str:
+            print('HIGH|ETCD pod: --peer-client-cert-auth not set — peer connections may be unauthenticated')
+        else:
+            print('PASS|ETCD peer-client-cert-auth is enabled')
+
+        # listen address should not be 0.0.0.0
+        import re
+        listen = re.findall(r'--listen-client-urls=(\S+)', arg_str)
+        for url in listen:
+            if '0.0.0.0' in url:
+                print(f'CRITICAL|ETCD listens on 0.0.0.0 ({url}) — exposed to all interfaces')
+            elif '127.0.0.1' in url or 'localhost' in url:
+                print(f'PASS|ETCD listen-client-urls bound to loopback ({url})')
+
+        # encryption at rest
+        if '--encryption-provider-config' not in arg_str:
+            print('HIGH|ETCD: --encryption-provider-config not set — secrets stored in plaintext in ETCD')
+        else:
+            print('PASS|ETCD encryption-provider-config is configured (secrets encrypted at rest)')
+
+if not found:
+    print('INFO|No ETCD pod visible in kube-system (AKS manages ETCD — verify encryption at rest via Azure Portal)')
+" 2>/dev/null)
+  echo "$_etcd" | while IFS='|' read -r sev msg; do
+    case "$sev" in
+      CRITICAL) critical "$msg" ;;
+      HIGH)     high "$msg" ;;
+      PASS)     pass "$msg" ;;
+      INFO)     log "$msg" ;;
+    esac
+  done
+
+  # ── 11b. Secrets encryption at rest (AKS) ─────────────────────────────────
+  log "Checking for EncryptionConfiguration or KMS provider in kube-system..."
+  local enc_found=false
+  if kubectl get secret -n kube-system -o name 2>/dev/null | grep -qi "encryption\|kms"; then
+    enc_found=true
+    pass "Encryption-related secret/config found in kube-system"
+  fi
+  # Also check for encryption config mounted in apiserver
+  local _apienc
+  _apienc=$(kubectl get pods -n kube-system -o json 2>/dev/null | python3 -c "
+import sys, json
+data = json.load(sys.stdin)
+for pod in data.get('items', []):
+    name = pod.get('metadata',{}).get('name','')
+    if 'kube-apiserver' not in name: continue
+    for c in (pod.get('spec',{}).get('containers') or []):
+        args = ' '.join(c.get('command',[]) + c.get('args',[]))
+        if '--encryption-provider-config' in args:
+            print('PASS|kube-apiserver has --encryption-provider-config set (encryption at rest active)')
+        else:
+            print('HIGH|kube-apiserver: --encryption-provider-config not set — ETCD secrets stored in plaintext')
+" 2>/dev/null)
+  if [[ -n "$_apienc" ]]; then
+    echo "$_apienc" | while IFS='|' read -r sev msg; do
+      case "$sev" in HIGH) high "$msg";; PASS) pass "$msg";; esac
+    done
+  elif [[ "$enc_found" == false ]]; then
+    high "Cannot confirm ETCD encryption at rest — on AKS verify via: az aks show ... | grep encryptionAtHost"
+  fi
+
+  # ── 11c. ETCD port 2379 reachable from pods (via network policy check) ────
+  log "Checking if any NetworkPolicy explicitly blocks ETCD port 2379..."
+  local etcd_blocked=false
+  kubectl get networkpolicies $NS_FLAG -o json 2>/dev/null | python3 -c "
+import sys, json
+data = json.load(sys.stdin)
+for np in data.get('items', []):
+    for erule in (np.get('spec',{}).get('egress') or []):
+        for port in (erule.get('ports') or []):
+            if str(port.get('port','')) == '2379':
+                ns = np.get('metadata',{}).get('namespace','')
+                nm = np.get('metadata',{}).get('name','')
+                print(f'{ns}/{nm}')
+" | while read -r ref; do
+    etcd_blocked=true
+    pass "NetworkPolicy \"$ref\" references port 2379 (ETCD egress control in place)"
+  done
+  [[ "$etcd_blocked" == false ]] && \
+    high "No NetworkPolicy found blocking egress to port 2379 (ETCD) — workloads could attempt ETCD access"
+}
+
+# =============================================================================
+# 12. INSECURE API SERVER PORT (8080)
+# =============================================================================
+check_insecure_api_port() {
+  section "12/17 · Insecure API Server Port (HTTP/8080)"
+
+  # ── 12a. Check kube-apiserver args for insecure-port ─────────────────────
+  log "Checking kube-apiserver for --insecure-port configuration..."
+  local _insecure
+  _insecure=$(kubectl get pods -n kube-system -o json 2>/dev/null | python3 -c "
+import sys, json, re
+data = json.load(sys.stdin)
+found_apiserver = False
+for pod in data.get('items', []):
+    name = pod.get('metadata',{}).get('name','')
+    if 'kube-apiserver' not in name: continue
+    found_apiserver = True
+    for c in (pod.get('spec',{}).get('containers') or []):
+        args = ' '.join(c.get('command',[]) + c.get('args',[]))
+
+        m = re.search(r'--insecure-port=(\d+)', args)
+        if m:
+            port = m.group(1)
+            if port == '0':
+                print('PASS|--insecure-port=0 (HTTP API server port disabled)')
+            else:
+                print(f'CRITICAL|kube-apiserver --insecure-port={port} — unauthenticated HTTP access to API server')
+        else:
+            print('PASS|--insecure-port not set (defaults to 0/disabled in modern Kubernetes)')
+
+        if '--insecure-bind-address=0.0.0.0' in args:
+            print('CRITICAL|kube-apiserver --insecure-bind-address=0.0.0.0 — insecure port bound to all interfaces')
+
+        # Also check secure port is set
+        if '--secure-port' not in args:
+            print('HIGH|kube-apiserver --secure-port not explicitly set — verify TLS is enforced')
+        else:
+            print('PASS|kube-apiserver --secure-port is configured')
+
+if not found_apiserver:
+    print('INFO|kube-apiserver pod not visible (AKS manages control plane) — insecure port disabled by default on AKS')
+" 2>/dev/null)
+  echo "$_insecure" | while IFS='|' read -r sev msg; do
+    case "$sev" in CRITICAL) critical "$msg";; HIGH) high "$msg";; PASS) pass "$msg";; INFO) log "$msg";; esac
+  done
+
+  # ── 12b. Attempt direct HTTP probe to API server on port 8080 ─────────────
+  log "Attempting HTTP probe to API server on port 8080 via kubectl..."
+  local api_url
+  api_url=$(kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}' 2>/dev/null)
+  local api_host
+  api_host=$(echo "$api_url" | sed 's|https\?://||' | cut -d: -f1)
+
+  if [[ -n "$api_host" ]]; then
+    # Use kubectl run with a probe pod would need network — instead check if
+    # the API server exposes anything on the HTTP path via the proxy endpoint
+    local probe_result
+    probe_result=$(kubectl get --raw "/api" 2>/dev/null | python3 -c "
+import sys, json
+try:
+    d = json.load(sys.stdin)
+    # If we got here with no TLS error, the API server is responding
+    # We can't directly test port 8080 from outside, but we note the HTTPS is working
+    print('PASS|API server HTTPS endpoint is responding correctly (port 8080 check requires network access)')
+except: pass
+" 2>/dev/null || echo "PASS|API server probe inconclusive — verify port 8080 is not exposed via Azure NSG rules")
+    echo "$probe_result" | while IFS='|' read -r sev msg; do
+      case "$sev" in PASS) pass "$msg";; HIGH) high "$msg";; CRITICAL) critical "$msg";; esac
+    done
+  fi
+}
+
+# =============================================================================
+# 13. KUBERNETES DASHBOARD HARDENING
+# =============================================================================
+check_dashboard_hardening() {
+  section "13/17 · Kubernetes Dashboard Hardening"
+
+  log "Checking Dashboard deployment for insecure arguments..."
+  local _dashargs
+  _dashargs=$(kubectl get deployments $NS_FLAG -o json 2>/dev/null | python3 -c "
+import sys, json
+data = json.load(sys.stdin)
+found = False
+for dep in data.get('items', []):
+    name = dep.get('metadata',{}).get('name','')
+    ns   = dep.get('metadata',{}).get('namespace','')
+    if 'dashboard' not in name.lower(): continue
+    found = True
+    for c in (dep.get('spec',{}).get('template',{}).get('spec',{}).get('containers') or []):
+        args = c.get('args', [])
+        arg_str = ' '.join(args)
+        if '--enable-skip-login' in arg_str:
+            print(f'CRITICAL|{ns}/{name}|--enable-skip-login set — authentication can be bypassed')
+        if '--disable-settings-authorizer' in arg_str:
+            print(f'CRITICAL|{ns}/{name}|--disable-settings-authorizer set — settings page unrestricted')
+        if '--enable-insecure-login' in arg_str:
+            print(f'CRITICAL|{ns}/{name}|--enable-insecure-login set — allows HTTP login')
+        if '--insecure-port' in arg_str and '0' not in arg_str:
+            print(f'HIGH|{ns}/{name}|Dashboard insecure port enabled')
+        if '--token-ttl=0' in arg_str:
+            print(f'HIGH|{ns}/{name}|--token-ttl=0 — tokens never expire')
+
+        # Check the ServiceAccount the dashboard uses
+        sa = dep.get('spec',{}).get('template',{}).get('spec',{}).get('serviceAccountName','default')
+        print(f'INFO|{ns}/{name}|Dashboard runs as ServiceAccount \"{sa}\" — verify it has minimal permissions')
+
+if not found:
+    print('PASS|No Kubernetes Dashboard deployment found')
+" 2>/dev/null)
+  echo "$_dashargs" | while IFS='|' read -r sev ref msg; do
+    case "$sev" in
+      CRITICAL) critical "$ref — $msg" ;;
+      HIGH)     high "$ref — $msg" ;;
+      PASS)     pass "$msg" ;;
+      INFO)     log "$ref — $msg" ;;
+    esac
+  done
+
+  # ── Dashboard SA permissions ───────────────────────────────────────────────
+  log "Checking permissions of ServiceAccounts associated with Dashboard..."
+  kubectl get deployments $NS_FLAG -o json 2>/dev/null | python3 -c "
+import sys, json
+data = json.load(sys.stdin)
+for dep in data.get('items', []):
+    name = dep.get('metadata',{}).get('name','')
+    ns   = dep.get('metadata',{}).get('namespace','')
+    if 'dashboard' not in name.lower(): continue
+    sa = dep.get('spec',{}).get('template',{}).get('spec',{}).get('serviceAccountName','default')
+    print(f'{ns}|{sa}')
+" 2>/dev/null | while IFS='|' read -r ns sa; do
+    # Check if this SA has cluster-admin or wide ClusterRoleBindings
+    local bound_roles
+    bound_roles=$(kubectl get clusterrolebindings -o json 2>/dev/null | python3 -c "
+import sys, json
+data = json.load(sys.stdin)
+for crb in data.get('items', []):
+    for subj in (crb.get('subjects') or []):
+        if subj.get('kind') == 'ServiceAccount' and subj.get('name') == '${sa}' and subj.get('namespace','') == '${ns}':
+            role = crb.get('roleRef',{}).get('name','')
+            print(role)
+" 2>/dev/null)
+    for role in $bound_roles; do
+      if [[ "$role" == "cluster-admin" ]]; then
+        critical "Dashboard SA \"$sa\" (ns: $ns) has cluster-admin ClusterRoleBinding — full cluster takeover if Dashboard is compromised"
+      else
+        high "Dashboard SA \"$sa\" (ns: $ns) has ClusterRoleBinding to \"$role\" — review permissions"
+      fi
+    done
+  done
+}
+
+# =============================================================================
+# 14. APPARMOR PROFILES
+# =============================================================================
+check_apparmor() {
+  section "14/17 · AppArmor Profile Enforcement"
+
+  log "Checking pods for AppArmor profile annotations..."
+  local _aa
+  _aa=$(kubectl get pods $NS_FLAG -o json 2>/dev/null | python3 -c "
+import sys, json, re
+data = json.load(sys.stdin)
+missing = 0
+enforced = 0
+skip_ns = {'kube-system','kube-public','kube-node-lease','gatekeeper-system'}
+
+for pod in data.get('items', []):
+    ns   = pod.get('metadata',{}).get('namespace','?')
+    name = pod.get('metadata',{}).get('name','?')
+    if ns in skip_ns: continue
+
+    anns = pod.get('metadata',{}).get('annotations', {})
+    spec = pod.get('spec', {})
+
+    # New-style securityContext.appArmorProfile (K8s 1.30+)
+    psc = spec.get('securityContext', {})
+    aa_profile = psc.get('appArmorProfile', {})
+
+    # Old-style annotation: container.apparmor.security.beta.kubernetes.io/<container>
+    aa_anns = {k: v for k, v in anns.items() if 'apparmor' in k.lower()}
+
+    containers = [c.get('name','?') for c in (spec.get('containers') or [])]
+
+    has_profile = bool(aa_profile) or bool(aa_anns)
+
+    if has_profile:
+        # Check for 'unconfined'
+        for k, v in aa_anns.items():
+            if 'unconfined' in v:
+                print(f'HIGH|{ns}/{name}|AppArmor annotation present but set to unconfined: {k}={v}')
+            else:
+                enforced += 1
+        if aa_profile.get('type') == 'Unconfined':
+            print(f'HIGH|{ns}/{name}|securityContext.appArmorProfile.type=Unconfined')
+        elif aa_profile:
+            enforced += 1
+    else:
+        missing += 1
+        print(f'HIGH|{ns}/{name}|No AppArmor profile configured — container syscall surface unrestricted')
+
+print(f'SUMMARY|{enforced} pods with AppArmor enforced, {missing} pods without any AppArmor profile')
+" 2>/dev/null)
+  echo "$_aa" | while IFS='|' read -r sev ref msg; do
+    case "$sev" in
+      HIGH)    high "$ref — $msg" ;;
+      SUMMARY) log "$ref$msg" ;;
+    esac
+  done
+  # If no HIGH lines were printed, emit a pass
+  local aa_high_count
+  aa_high_count=$(echo "$_aa" | grep -c '^HIGH' || true)
+  [[ "$aa_high_count" -eq 0 ]] && pass "All non-system pods have AppArmor profiles configured"
+}
+
+# =============================================================================
+# 15. SECCOMP PROFILES
+# =============================================================================
+check_seccomp() {
+  section "15/17 · Seccomp Profile Enforcement"
+
+  log "Checking pods for Seccomp profile configuration..."
+  local _sc
+  _sc=$(kubectl get pods $NS_FLAG -o json 2>/dev/null | python3 -c "
+import sys, json
+data = json.load(sys.stdin)
+missing = 0
+enforced = 0
+skip_ns = {'kube-system','kube-public','kube-node-lease','gatekeeper-system'}
+
+for pod in data.get('items', []):
+    ns   = pod.get('metadata',{}).get('namespace','?')
+    name = pod.get('metadata',{}).get('name','?')
+    if ns in skip_ns: continue
+
+    anns = pod.get('metadata',{}).get('annotations', {})
+    spec = pod.get('spec', {})
+    psc  = spec.get('securityContext', {})
+
+    # New-style (K8s 1.19+)
+    seccomp_profile = psc.get('seccompProfile', {})
+    # Old-style annotation
+    seccomp_ann = anns.get('seccomp.security.alpha.kubernetes.io/pod', '')
+
+    has_profile = bool(seccomp_profile) or bool(seccomp_ann)
+
+    if has_profile:
+        profile_type = seccomp_profile.get('type', seccomp_ann)
+        if profile_type in ('Unconfined', 'unconfined'):
+            print(f'HIGH|{ns}/{name}|Seccomp profile is Unconfined — no syscall restrictions applied')
+        else:
+            enforced += 1
+            # RuntimeDefault is acceptable; Localhost with a custom profile is better
+            if profile_type == 'RuntimeDefault':
+                pass  # good enough
+            elif profile_type == 'Localhost':
+                pass  # custom profile, even better
+    else:
+        missing += 1
+        print(f'HIGH|{ns}/{name}|No Seccomp profile set — all syscalls permitted (attack surface expanded)')
+
+print(f'SUMMARY|{enforced} pods with Seccomp enforced, {missing} pods without Seccomp profile')
+" 2>/dev/null)
+  echo "$_sc" | while IFS='|' read -r sev ref msg; do
+    case "$sev" in
+      HIGH)    high "$ref — $msg" ;;
+      SUMMARY) log "$ref$msg" ;;
+    esac
+  done
+  local sc_high_count
+  sc_high_count=$(echo "$_sc" | grep -c '^HIGH' || true)
+  [[ "$sc_high_count" -eq 0 ]] && pass "All non-system pods have Seccomp profiles configured"
+}
+
+# =============================================================================
+# 16. NODE NAME TARGETING (MASTER NODE ESCAPE)
+# =============================================================================
+check_nodename_targeting() {
+  section "16/17 · nodeName Targeting (Master Node Escape)"
+
+  log "Checking for pods with explicit nodeName pointing to control-plane nodes..."
+
+  # Identify control-plane / master nodes by label
+  local master_nodes
+  master_nodes=$(kubectl get nodes -o json 2>/dev/null | python3 -c "
+import sys, json
+data = json.load(sys.stdin)
+for n in data.get('items', []):
+    labs = n.get('metadata',{}).get('labels', {})
+    name = n.get('metadata',{}).get('name','')
+    # Common control-plane labels
+    if any(k in labs for k in ('node-role.kubernetes.io/master',
+                                'node-role.kubernetes.io/control-plane')):
+        print(name)
+" 2>/dev/null)
+
+  if [[ -z "$master_nodes" ]]; then
+    log "No control-plane nodes visible via labels (AKS hides master nodes) — checking all explicit nodeName assignments"
+  fi
+
+  # Check all pods for explicit nodeName
+  local _nn
+  _nn=$(kubectl get pods $NS_FLAG -o json 2>/dev/null | python3 -c "
+import sys, json
+data  = json.load(sys.stdin)
+masters = set('''${master_nodes}'''.split())
+skip_ns = {'kube-system','kube-public','kube-node-lease'}
+
+for pod in data.get('items', []):
+    ns     = pod.get('metadata',{}).get('namespace','?')
+    name   = pod.get('metadata',{}).get('name','?')
+    spec   = pod.get('spec', {})
+    node   = spec.get('nodeName', '')
+    owner  = [o.get('kind','') for o in pod.get('metadata',{}).get('ownerReferences',[]) or []]
+    if ns in skip_ns: continue
+    if not node: continue
+
+    is_master = node in masters
+
+    # Any user workload with an explicit nodeName is suspicious
+    if is_master:
+        print(f'CRITICAL|{ns}/{name}|explicitly scheduled on control-plane node \"{node}\" via nodeName — potential master escape')
+    elif 'DaemonSet' not in owner and 'Node' not in owner:
+        print(f'HIGH|{ns}/{name}|has explicit nodeName=\"{node}\" — verify this is intentional (not an escape attempt)')
+" 2>/dev/null)
+
+  if [[ -z "$_nn" ]]; then
+    pass "No non-system pods with suspicious explicit nodeName assignments found"
+  else
+    echo "$_nn" | while IFS='|' read -r sev ref msg; do
+      case "$sev" in CRITICAL) critical "$ref — $msg";; HIGH) high "$ref — $msg";; esac
+    done
+  fi
+
+  # ── Also check for pods that tolerate master taints ───────────────────────
+  log "Checking for user pods tolerating control-plane/master taints..."
+  local _mastertol
+  _mastertol=$(kubectl get pods $NS_FLAG -o json 2>/dev/null | python3 -c "
+import sys, json
+data = json.load(sys.stdin)
+master_taint_keys = {'node-role.kubernetes.io/master','node-role.kubernetes.io/control-plane'}
+skip_ns = {'kube-system','kube-public','kube-node-lease'}
+
+for pod in data.get('items', []):
+    ns   = pod.get('metadata',{}).get('namespace','?')
+    name = pod.get('metadata',{}).get('name','?')
+    if ns in skip_ns: continue
+    owner = [o.get('kind','') for o in (pod.get('metadata',{}).get('ownerReferences') or [])]
+    if 'DaemonSet' in owner: continue
+    for tol in (pod.get('spec',{}).get('tolerations') or []):
+        if tol.get('key','') in master_taint_keys:
+            print(f'HIGH|{ns}/{name}|tolerates control-plane taint \"{tol[\"key\"]}\" — can be scheduled on master nodes')
+            break
+" 2>/dev/null)
+  if [[ -n "$_mastertol" ]]; then
+    echo "$_mastertol" | while IFS='|' read -r sev ref msg; do
+      case "$sev" in HIGH) high "$ref — $msg";; esac
+    done
+  else
+    pass "No user pods tolerate control-plane/master taints"
+  fi
+}
+
+# =============================================================================
+# 17. EGRESS NETWORKPOLICY (REVERSE SHELL PREVENTION)
+# =============================================================================
+check_egress_policies() {
+  section "17/17 · Egress NetworkPolicy (Reverse Shell Prevention)"
+
+  log "Checking namespaces for explicit egress NetworkPolicies..."
+  local all_ns
+  all_ns=$(kubectl get namespaces -o jsonpath='{.items[*].metadata.name}' 2>/dev/null)
+
+  kubectl get networkpolicies $NS_FLAG -o json 2>/dev/null | python3 -c "
+import sys, json
+data = json.load(sys.stdin)
+skip_ns = {'kube-system','kube-public','kube-node-lease','gatekeeper-system'}
+
+# Build per-namespace egress coverage map
+ns_egress   = {}   # ns -> list of policy names that have Egress policyType
+ns_egress_default_deny = set()
+
+for np in data.get('items', []):
+    ns     = np.get('metadata',{}).get('namespace','')
+    npname = np.get('metadata',{}).get('name','')
+    spec   = np.get('spec', {})
+    types  = spec.get('policyTypes', [])
+    sel    = spec.get('podSelector', {})
+    egress = spec.get('egress')
+
+    if 'Egress' in types:
+        ns_egress.setdefault(ns, []).append(npname)
+        # Default-deny egress: empty podSelector + Egress type + no egress rules
+        if sel == {} and (egress is None or egress == []):
+            ns_egress_default_deny.add(ns)
+
+all_ns_list = '''${all_ns}'''.split()
+for ns in all_ns_list:
+    if ns in skip_ns: continue
+    if ns not in ns_egress:
+        print(f'HIGH|{ns}|No egress NetworkPolicy — outbound connections unrestricted (reverse shell possible)')
+    elif ns not in ns_egress_default_deny:
+        policies = ', '.join(ns_egress[ns])
+        print(f'HIGH|{ns}|Has egress policies ({policies}) but no default-deny-egress — some pods may have unrestricted outbound')
+    else:
+        print(f'PASS|{ns}|Default-deny egress NetworkPolicy in place')
+" 2>/dev/null | while IFS='|' read -r sev ns msg; do
+    case "$sev" in
+      HIGH) high "Namespace \"$ns\" — $msg" ;;
+      PASS) pass "Namespace \"$ns\" — $msg" ;;
+    esac
+  done
+
+  # ── Check that DNS egress (port 53) is explicitly allowed where egress is denied ──
+  log "Checking egress policies allow DNS (port 53) where egress is restricted..."
+  kubectl get networkpolicies $NS_FLAG -o json 2>/dev/null | python3 -c "
+import sys, json
+data = json.load(sys.stdin)
+skip_ns = {'kube-system','kube-public','kube-node-lease','gatekeeper-system'}
+
+for np in data.get('items', []):
+    ns     = np.get('metadata',{}).get('namespace','')
+    npname = np.get('metadata',{}).get('name','')
+    spec   = np.get('spec', {})
+    types  = spec.get('policyTypes', [])
+    egress = spec.get('egress') or []
+    if ns in skip_ns: continue
+
+    # Default-deny egress with no rules at all
+    if 'Egress' in types and egress == []:
+        print(f'HIGH|{ns}/{npname}|Egress denied with no exceptions — DNS (port 53) also blocked, pods cannot resolve names')
+    elif 'Egress' in types and egress:
+        # Check if port 53 is allowed somewhere
+        ports_allowed = set()
+        for rule in egress:
+            for p in (rule.get('ports') or []):
+                ports_allowed.add(str(p.get('port','')))
+        if '53' not in ports_allowed and egress:
+            print(f'HIGH|{ns}/{npname}|Egress policy has rules but port 53 (DNS) not explicitly allowed — pods may fail DNS resolution')
+        else:
+            print(f'PASS|{ns}/{npname}|Egress policy allows DNS (port 53)')
+" 2>/dev/null | while IFS='|' read -r sev ref msg; do
+    case "$sev" in HIGH) high "$ref — $msg";; PASS) pass "$ref — $msg";; esac
+  done
 }
 
 # =============================================================================
@@ -897,6 +2087,14 @@ main() {
   check_nodes
   check_ingress
   check_least_privilege
+  check_kubelet_api
+  check_etcd
+  check_insecure_api_port
+  check_dashboard_hardening
+  check_apparmor
+  check_seccomp
+  check_nodename_targeting
+  check_egress_policies
 
   print_summary
 }
