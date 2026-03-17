@@ -25,6 +25,7 @@ RED='\033[0;31m'
 ORANGE='\033[0;33m'
 GREEN='\033[0;32m'
 CYAN='\033[0;36m'
+BLUE='\033[0;34m'
 YELLOW='\033[1;33m'
 PURPLE='\033[0;35m'
 BOLD='\033[1m'
@@ -86,7 +87,8 @@ poc() {
 # Decode a base64 secret value and print redacted preview + retrieve command
 # Usage: secret_peek <namespace> <secret-name> <key>
 secret_peek() {
-  local ns="$1" sname="$2" key="$3"
+  local ns="${1:-}" sname="${2:-}" key="${3:-}"
+  [[ -z "$ns" || -z "$sname" || -z "$key" ]] && return 0
   local b64
   b64=$(kctl get secret "$sname" -n "$ns" \
     -o jsonpath="{.data['${key//\//\\/}']}" 2>/dev/null | tr -d '\n' || true)
